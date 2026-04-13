@@ -19,6 +19,7 @@ export interface RemoteSessionInfo {
   permissionMode?: PermissionMode;
   effortLevel?: EffortLevel;
   committed?: boolean;
+  state?: 'idle' | 'running' | 'waiting_permission' | 'waiting_question';
 }
 
 export interface AuthStatus {

@@ -130,6 +130,8 @@ interface ManagedSession {
   projectOverride?: string;
   /** Whether a git commit command has been detected in this session. */
   committed: boolean;
+  /** Current session state: idle (waiting for user input) or running (Claude is working). */
+  sessionState: 'idle' | 'running';
   /** Whether the session is still running. */
   alive: boolean;
   /** Number of times this session has been auto-restarted after crash. */
@@ -172,6 +174,7 @@ export class SdkSessionManager {
       title: null,
       summarized: false,
       committed: false,
+      sessionState: 'idle',
       alive: true,
       restartCount: 0,
     };
@@ -417,6 +420,9 @@ export class SdkSessionManager {
         permissionMode: s.permissionMode as 'default' | 'acceptEdits' | 'plan',
         committed: s.committed || undefined,
         effortLevel: s.effortLevel,
+        state: s.pendingPermissions.size > 0 ? 'waiting_permission'
+          : s.pendingQuestions.size > 0 ? 'waiting_question'
+          : s.sessionState,
       });
     }
     return sessions;
@@ -579,6 +585,12 @@ export class SdkSessionManager {
             version: sysMsg.claude_code_version,
           });
           this.events.onSessionListChanged(this.getSessions());
+        }
+
+        // Track session state changes (idle = waiting for user input)
+        if (msg.type === 'system' && (msg as SDKSystemMessage).subtype === 'session_state_changed') {
+          const stateMsg = msg as unknown as { state: string };
+          session.sessionState = stateMsg.state === 'idle' ? 'idle' : 'running';
         }
 
         const entries = sdkMessageToEntries(msg);
