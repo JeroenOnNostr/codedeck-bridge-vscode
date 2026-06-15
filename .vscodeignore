@@ -5,6 +5,13 @@ tsconfig.json
 **/*.ts
 !out/**
 # node_modules are managed by vsce: production dependencies are included automatically
+# Exclude Agent SDK platform binaries we don't run here. This is a Linux glibc host/bridge,
+# so we keep only @anthropic-ai/claude-agent-sdk-linux-x64 and drop the others (musl/win/mac),
+# which otherwise add ~230 MB each to the .vsix.
+node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl/**
+node_modules/@anthropic-ai/claude-agent-sdk-win32-**/**
+node_modules/@anthropic-ai/claude-agent-sdk-darwin-**/**
 CLAUDE.md
 TODO.md
+DONE.md
 *.vsix
