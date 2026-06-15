@@ -8,11 +8,15 @@ import type {
   InputMessage,
   PermissionResponseMessage,
   ModeChangeMessage,
+  ModelChangeMessage,
+  ModelConfirmedMessage,
+  EffortChangeMessage,
+  CreateSessionMessage,
   HistoryRequestMessage,
   OutputEntry,
   RemoteSessionInfo,
 } from '../types';
-import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND } from '../types';
+import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND, PROTOCOL_VERSION } from '../types';
 
 describe('Protocol types', () => {
   describe('Event kinds', () => {
@@ -50,6 +54,20 @@ describe('Protocol types', () => {
         expect(parsed.machine).toBe('jeroen-laptop');
         expect(parsed.sessions).toHaveLength(2);
         expect(parsed.sessions[0].slug).toBe('my-project');
+      }
+    });
+
+    it('session list advertises the protocol version', () => {
+      expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(1);
+      const msg: SessionListMessage = {
+        type: 'sessions',
+        machine: 'laptop',
+        sessions: [],
+        protocolVersion: PROTOCOL_VERSION,
+      };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      if (parsed.type === 'sessions') {
+        expect(parsed.protocolVersion).toBe(PROTOCOL_VERSION);
       }
     });
 
@@ -112,6 +130,32 @@ describe('Protocol types', () => {
         expect(parsed.requestId).toBe('req-abc-123');
       }
     });
+
+    it('serializes model-confirmed feedback', () => {
+      const msg: ModelConfirmedMessage = {
+        type: 'model-confirmed',
+        sessionId: 'sess-1',
+        model: 'claude-sonnet-4-6',
+      };
+
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('model-confirmed');
+      if (parsed.type === 'model-confirmed') {
+        expect(parsed.model).toBe('claude-sonnet-4-6');
+      }
+    });
+
+    it('session list reports per-session model', () => {
+      const sessions: RemoteSessionInfo[] = [
+        { id: 'sess-1', slug: 'p', cwd: '/w', lastActivity: 't', lineCount: 1, title: null, project: 'w', model: 'claude-opus-4-8', effortLevel: 'max' },
+      ];
+      const msg: SessionListMessage = { type: 'sessions', machine: 'laptop', sessions };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      if (parsed.type === 'sessions') {
+        expect(parsed.sessions[0].model).toBe('claude-opus-4-8');
+        expect(parsed.sessions[0].effortLevel).toBe('max');
+      }
+    });
   });
 
   describe('Bridge inbound messages (phone → bridge)', () => {
@@ -163,6 +207,57 @@ describe('Protocol types', () => {
       if (parsed.type === 'mode') {
         expect(parsed.mode).toBe('default');
       }
+    });
+
+    it('serializes effort change with xhigh level', () => {
+      const msg: EffortChangeMessage = {
+        type: 'effort',
+        sessionId: 'sess-1',
+        level: 'xhigh',
+      };
+
+      const parsed: BridgeInbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('effort');
+      if (parsed.type === 'effort') {
+        expect(parsed.level).toBe('xhigh');
+      }
+    });
+
+    it('serializes model change', () => {
+      const msg: ModelChangeMessage = {
+        type: 'model',
+        sessionId: 'sess-1',
+        model: 'claude-opus-4-8',
+      };
+
+      const parsed: BridgeInbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('model');
+      if (parsed.type === 'model') {
+        expect(parsed.model).toBe('claude-opus-4-8');
+      }
+    });
+
+    it('serializes create-session with model and default effort', () => {
+      const msg: CreateSessionMessage = {
+        type: 'create-session',
+        defaultEffort: 'max',
+        model: 'claude-fable-5',
+      };
+
+      const parsed: BridgeInbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('create-session');
+      if (parsed.type === 'create-session') {
+        expect(parsed.defaultEffort).toBe('max');
+        expect(parsed.model).toBe('claude-fable-5');
+      }
+    });
+
+    it('serializes bare create-session (no model/effort)', () => {
+      const msg: CreateSessionMessage = { type: 'create-session' };
+      const parsed = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('create-session');
+      expect(parsed.model).toBeUndefined();
+      expect(parsed.defaultEffort).toBeUndefined();
     });
 
     it('serializes history request', () => {

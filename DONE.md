@@ -1,5 +1,12 @@
 # Done — Codedeck Bridge (VSCode Extension)
 
+## SDK Upgrade, Effort & Model Control (2026-06-15, v0.6.0)
+
+- [x] **CDB-010: Upgrade Agent SDK 0.2.92 → 0.3.177** — Low-risk bump (we use only `setPermissionMode`/`interrupt`/`applyFlagSettings`, none of the removed V2/TodoWrite/maxThinkingTokens APIs). Only breakage: `session_state_changed` is now its own `SDKSessionStateChangedMessage` type (was a `SDKSystemMessage` subtype) — fixed the comparison in `sdkSession.ts`. NOTE: `npm install` requires `--legacy-peer-deps` (SDK 0.3.x declares `@anthropic-ai/sdk` as a peer; it's types-only at our usage and marked external in esbuild).
+- [x] **CDB-011: True `xhigh`/`max` effort** — `setEffortLevel` now passes `low|medium|high|xhigh` straight to `applyFlagSettings` (0.3.x widened it); mid-session `max` maps to `xhigh` (the strongest the mid-session API allows — `Settings.effortLevel` still excludes `max`). True `max`/`xhigh` from turn one is applied via `Options.effort` at `query()` construction in `createSession()` (and on the resume path).
+- [x] **CDB-012: Model selection** — New `model`/`model-confirmed` protocol messages + `model` on `create-session`. `createSession()` accepts a model and sets `Options.model`; new `setModel()` calls `query.setModel()` mid-session; `getSessions()` reports the live model; resume re-applies it.
+- [x] **CDB-013: Fallback model** — `Options.fallbackModel = 'claude-sonnet-4-6'` on new + resumed sessions so an overloaded primary degrades gracefully.
+
 ## Architecture
 
 - [x] **Event-driven new session detection** — Replaced polling loop in `core.ts:waitForNewSession()` with `awaitNewSession()`, one-shot promise resolving on `SessionWatcher.onNewSession`. Added `scanForNewFiles()` backup scan (every 3s). 60s timeout safety net.

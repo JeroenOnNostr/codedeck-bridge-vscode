@@ -27,7 +27,7 @@ import type {
   SessionFailedMessage,
   InputFailedMessage,
 } from './types';
-import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND } from './types';
+import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND, PROTOCOL_VERSION } from './types';
 
 export interface NostrRelayEvents {
   onInput: (sessionId: string, text: string, phonePubkey: string) => void;
@@ -36,8 +36,9 @@ export interface NostrRelayEvents {
   onKeypress: (sessionId: string, key: string, context?: 'plan-approval' | 'exit-plan' | 'question') => void;
   onModeChange: (sessionId: string, mode: string) => void;
   onEffortChange: (sessionId: string, effort: string) => void;
+  onModelChange: (sessionId: string, model: string) => void;
   onHistoryRequest: (sessionId: string, afterSeq: number | undefined, phonePubkey: string) => void;
-  onCreateSession: (defaultEffort?: string) => void;
+  onCreateSession: (defaultEffort?: string, model?: string) => void;
   onRefreshSessions: () => void;
   onCloseSession: (sessionId: string) => void;
   onInterrupt: (sessionId: string) => void;
@@ -351,6 +352,7 @@ export class NostrRelay {
       type: 'sessions',
       machine: this.machineName,
       sessions,
+      protocolVersion: PROTOCOL_VERSION,
     };
 
     const json = JSON.stringify(msg);
@@ -718,6 +720,17 @@ export class NostrRelay {
     return this.publishToAllPhones(msg, 30);
   }
 
+  /** Publish model-confirmed feedback after a model change (NIP-40: expires in 30s). */
+  async publishModelConfirmed(sessionId: string, model: string): Promise<boolean> {
+    const msg: import('./types').ModelConfirmedMessage = {
+      type: 'model-confirmed',
+      sessionId,
+      model,
+    };
+    this.log(`[Codedeck] Publishing model-confirmed: session=${sessionId}, model=${model}`);
+    return this.publishToAllPhones(msg, 30);
+  }
+
   private static readonly HISTORY_CHUNK_SIZE = 20;
   private static readonly MAX_CHUNK_JSON_BYTES = 48_000;
   private static readonly CHUNK_DELAY_MS = 500;
@@ -898,11 +911,15 @@ export class NostrRelay {
           Promise.resolve(this.events.onEffortChange(msg.sessionId, msg.level))
             .catch(err => console.error('[Codedeck] onEffortChange handler error:', err));
           break;
+        case 'model':
+          Promise.resolve(this.events.onModelChange(msg.sessionId, msg.model))
+            .catch(err => console.error('[Codedeck] onModelChange handler error:', err));
+          break;
         case 'history-request':
           this.events.onHistoryRequest(msg.sessionId, msg.afterSeq, event.pubkey);
           break;
         case 'create-session':
-          Promise.resolve(this.events.onCreateSession((msg as { defaultEffort?: string }).defaultEffort))
+          Promise.resolve(this.events.onCreateSession(msg.defaultEffort, msg.model))
             .catch(err => this.log(`[Codedeck] onCreateSession handler error: ${err}`));
           break;
         case 'refresh-sessions':

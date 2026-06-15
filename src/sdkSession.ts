@@ -15,6 +15,7 @@ import type {
   SDKMessage,
   SDKUserMessage,
   SDKSystemMessage,
+  SDKSessionStateChangedMessage,
   PermissionResult,
   PermissionUpdate,
   PermissionMode,
@@ -23,6 +24,30 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import type { EffortLevel, OutputEntry, RemoteSessionInfo } from './types';
 import { sdkMessageToEntries } from './sdkAdapter';
+
+/**
+ * Fallback model used by every session's query() Options. If the primary model is
+ * overloaded or unavailable, the SDK degrades to this rather than failing the turn.
+ */
+const FALLBACK_MODEL = 'claude-sonnet-4-6';
+
+/**
+ * Map a phone effort level to the SDK's Options.effort value (used at query() construction).
+ * Unlike the mid-session applyFlagSettings path, Options.effort accepts the full set incl. 'max',
+ * so a session can be *born* at true 'max'/'xhigh'. 'auto' / undefined → omit (model default).
+ */
+function toOptionsEffort(effort?: EffortLevel): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined {
+  switch (effort) {
+    case 'low':
+    case 'medium':
+    case 'high':
+    case 'xhigh':
+    case 'max':
+      return effort;
+    default:
+      return undefined; // 'auto' or unset → model default
+  }
+}
 
 // --- Async input generator ---
 
@@ -103,6 +128,8 @@ interface ManagedSession {
   permissionMode: PermissionMode;
   /** Phone-level effort (e.g. 'high', 'max') — tracked so getSessions() can report it. */
   effortLevel?: EffortLevel;
+  /** Selected Claude model ID (e.g. 'claude-opus-4-8') — tracked so getSessions() can report it and resume can re-apply it. */
+  model?: string;
   /** Output entries history for catch-up. */
   history: Array<{ seq: number; entry: OutputEntry }>;
   /** Pending permission requests awaiting phone response, keyed by toolUseId. */
@@ -149,8 +176,19 @@ export class SdkSessionManager {
     this.events = events;
   }
 
-  /** Create a new Claude Code session via the Agent SDK. */
-  createSession(sessionId: string, cwd: string, initialPermissionMode: PermissionMode = 'plan'): void {
+  /**
+   * Create a new Claude Code session via the Agent SDK.
+   * @param model   Optional Claude model ID (e.g. 'claude-opus-4-8'). Falls back to the SDK default if omitted.
+   * @param effort  Optional initial effort level. Applied at query() construction so 'max'/'xhigh' take effect
+   *                from the first turn (the mid-session applyFlagSettings path cannot reach 'max').
+   */
+  createSession(
+    sessionId: string,
+    cwd: string,
+    initialPermissionMode: PermissionMode = 'plan',
+    model?: string,
+    effort?: EffortLevel,
+  ): void {
     if (this.sessions.has(sessionId)) {
       this.events.log(`[SDK] Session ${sessionId} already exists`);
       return;
@@ -166,6 +204,8 @@ export class SdkSessionManager {
       seqCounter: 0,
       cwd,
       permissionMode: initialPermissionMode,
+      effortLevel: effort,
+      model,
       history: [],
       pendingPermissions: new Map(),
       answeredQuestions: new Set(),
@@ -183,6 +223,7 @@ export class SdkSessionManager {
       return this.handlePermission(sessionId, session, toolName, toolInput, options);
     };
 
+    const optionsEffort = toOptionsEffort(effort);
     const options: Options = {
       sessionId,
       cwd,
@@ -192,7 +233,11 @@ export class SdkSessionManager {
       settingSources: ['user', 'project'],
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       tools: { type: 'preset', preset: 'claude_code' },
+      fallbackModel: FALLBACK_MODEL,
+      ...(model ? { model } : {}),
+      ...(optionsEffort ? { effort: optionsEffort } : {}),
     };
+    this.events.log(`[SDK] Creating session ${sessionId} (model: ${model ?? 'default'}, effort: ${optionsEffort ?? 'default'})`);
 
     const q = query({ prompt: input.generator, options });
     session.query = q;
@@ -348,22 +393,29 @@ export class SdkSessionManager {
     const session = this.sessions.get(sessionId);
     if (!session || !session.alive) { return { applied: false, confirmedLevel: effort }; }
 
-    // Map phone effort levels to SDK-compatible values.
-    // SDK applyFlagSettings accepts 'low' | 'medium' | 'high', or undefined to reset to model default.
-    // Phone sends 'max' (→ high) and 'auto' (→ undefined/reset).
-    let sdkEffort: 'low' | 'medium' | 'high' | undefined;
+    // Map phone effort levels to SDK-compatible values for the MID-SESSION path.
+    // SDK 0.3.x applyFlagSettings (Settings.effortLevel) accepts 'low' | 'medium' | 'high' | 'xhigh',
+    // or undefined to reset to model default. Note it does NOT accept 'max' — true 'max' is only
+    // reachable at query() construction via Options.effort (handled in createSession()).
+    // So mid-session we map 'max' → 'xhigh' (the strongest the mid-session API allows) and 'auto' → reset.
+    // The SDK itself silently downgrades 'xhigh' → 'high' on models that don't support it.
+    let sdkEffort: 'low' | 'medium' | 'high' | 'xhigh' | undefined;
+    let confirmedLevel = effort;
     switch (effort) {
       case 'low':
       case 'medium':
       case 'high':
+      case 'xhigh':
         sdkEffort = effort;
         break;
       case 'max':
-        sdkEffort = 'high';
-        this.events.log(`[SDK] Mapping effort 'max' → 'high' for ${sessionId}`);
+        sdkEffort = 'xhigh';
+        confirmedLevel = 'xhigh';
+        this.events.log(`[SDK] Mapping effort 'max' → 'xhigh' mid-session for ${sessionId} (true 'max' needs a fresh session)`);
         break;
       case 'auto':
         sdkEffort = undefined; // Reset to model default
+        confirmedLevel = 'auto';
         this.events.log(`[SDK] Resetting effort to model default for ${sessionId}`);
         break;
       default:
@@ -373,13 +425,34 @@ export class SdkSessionManager {
 
     try {
       await session.query.applyFlagSettings({ effortLevel: sdkEffort });
-      session.effortLevel = effort as EffortLevel;
-      this.events.log(`[SDK] Effort level set to ${sdkEffort} for ${sessionId}`);
-      // Confirm with the original phone level (e.g. 'max') so phone UI stays consistent
-      return { applied: true, confirmedLevel: effort };
+      session.effortLevel = confirmedLevel as EffortLevel;
+      this.events.log(`[SDK] Effort level set to ${sdkEffort ?? 'model default'} for ${sessionId}`);
+      // Confirm with the actually-applied level so the phone UI reflects reality.
+      return { applied: true, confirmedLevel };
     } catch (err) {
       this.events.log(`[SDK] Failed to set effort level for ${sessionId}: ${err}`);
       return { applied: false, confirmedLevel: effort };
+    }
+  }
+
+  /**
+   * Change the Claude model for a session mid-session.
+   * Returns { applied, confirmedModel } so the caller always has a value to confirm back to the phone.
+   * Mirrors setEffortLevel's contract.
+   */
+  async setModel(sessionId: string, model: string): Promise<{ applied: boolean; confirmedModel: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.alive) { return { applied: false, confirmedModel: model }; }
+
+    try {
+      await session.query.setModel(model);
+      session.model = model;
+      this.events.log(`[SDK] Model set to ${model} for ${sessionId}`);
+      return { applied: true, confirmedModel: model };
+    } catch (err) {
+      this.events.log(`[SDK] Failed to set model for ${sessionId}: ${err}`);
+      // Confirm the previously-known model so the phone UI doesn't show a model that didn't take.
+      return { applied: false, confirmedModel: session.model ?? model };
     }
   }
 
@@ -420,6 +493,7 @@ export class SdkSessionManager {
         permissionMode: s.permissionMode as 'default' | 'acceptEdits' | 'plan',
         committed: s.committed || undefined,
         effortLevel: s.effortLevel,
+        model: s.model,
         state: s.pendingPermissions.size > 0 ? 'waiting_permission'
           : s.pendingQuestions.size > 0 ? 'waiting_question'
           : s.sessionState,
@@ -587,9 +661,11 @@ export class SdkSessionManager {
           this.events.onSessionListChanged(this.getSessions());
         }
 
-        // Track session state changes (idle = waiting for user input)
-        if (msg.type === 'system' && (msg as SDKSystemMessage).subtype === 'session_state_changed') {
-          const stateMsg = msg as unknown as { state: string };
+        // Track session state changes (idle = waiting for user input).
+        // SDK 0.3.x: session_state_changed is its own message type (SDKSessionStateChangedMessage),
+        // no longer a subtype of SDKSystemMessage.
+        if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'session_state_changed') {
+          const stateMsg = msg as SDKSessionStateChangedMessage;
           session.sessionState = stateMsg.state === 'idle' ? 'idle' : 'running';
         }
 
@@ -672,6 +748,7 @@ export class SdkSessionManager {
         session.input = newInput;
         session.abortController = newAbort;
 
+        const resumeEffort = toOptionsEffort(session.effortLevel);
         const newQ = query({
           prompt: newInput.generator,
           options: {
@@ -685,6 +762,9 @@ export class SdkSessionManager {
             settingSources: ['user', 'project'],
             systemPrompt: { type: 'preset', preset: 'claude_code' },
             tools: { type: 'preset', preset: 'claude_code' },
+            fallbackModel: FALLBACK_MODEL,
+            ...(session.model ? { model: session.model } : {}),
+            ...(resumeEffort ? { effort: resumeEffort } : {}),
           },
         });
         session.query = newQ;

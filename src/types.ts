@@ -18,6 +18,7 @@ export interface RemoteSessionInfo {
   hasTerminal?: boolean;
   permissionMode?: PermissionMode;
   effortLevel?: EffortLevel;
+  model?: string;
   committed?: boolean;
   state?: 'idle' | 'running' | 'waiting_permission' | 'waiting_question';
 }
@@ -33,6 +34,8 @@ export interface SessionListMessage {
   machine: string;
   sessions: RemoteSessionInfo[];
   authStatus?: AuthStatus;
+  /** Bridge protocol version (see PROTOCOL_VERSION). Absent → pre-v1 bridge with no model support. */
+  protocolVersion?: number;
 }
 
 // --- Output Relay (bridge → phone) ---
@@ -90,7 +93,7 @@ export interface KeypressMessage {
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan';
 
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max' | 'auto';
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto';
 
 export interface ModeChangeMessage {
   type: 'mode';
@@ -102,6 +105,12 @@ export interface EffortChangeMessage {
   type: 'effort';
   sessionId: string;
   level: EffortLevel;
+}
+
+export interface ModelChangeMessage {
+  type: 'model';
+  sessionId: string;
+  model: string;
 }
 
 // --- History catch-up (phone → bridge → phone) ---
@@ -128,6 +137,10 @@ export interface HistoryResponseMessage {
 
 export interface CreateSessionMessage {
   type: 'create-session';
+  /** Initial effort level for the new session (applied at query() construction). */
+  defaultEffort?: EffortLevel;
+  /** Claude model ID for the new session (e.g. 'claude-opus-4-8'). */
+  model?: string;
 }
 
 // --- Refresh sessions (phone → bridge) ---
@@ -233,6 +246,12 @@ export interface EffortConfirmedMessage {
   level: EffortLevel;
 }
 
+export interface ModelConfirmedMessage {
+  type: 'model-confirmed';
+  sessionId: string;
+  model: string;
+}
+
 export interface InterruptMessage {
   type: 'interrupt';
   sessionId: string;
@@ -258,9 +277,16 @@ export interface CredentialsAckMessage {
 
 // --- Union ---
 
-export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | CredentialsAckMessage;
-export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | SetCredentialsMessage;
+export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | CredentialsAckMessage;
+export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | SetCredentialsMessage;
 export type BridgeMessage = BridgeOutbound | BridgeInbound;
+
+/**
+ * Bridge protocol version, advertised on the session list message.
+ * v1 = supports per-session model selection (`model` / `model-confirmed`) and the widened
+ * effort set (`xhigh`). A phone uses this to gate features against older bridges.
+ */
+export const PROTOCOL_VERSION = 1;
 
 // --- Nostr event kinds ---
 

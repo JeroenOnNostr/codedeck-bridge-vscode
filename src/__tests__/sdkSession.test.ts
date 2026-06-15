@@ -12,6 +12,8 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     return Object.assign(gen, {
       setPermissionMode: vi.fn().mockResolvedValue(undefined),
       applyFlagSettings: vi.fn().mockResolvedValue(undefined),
+      setModel: vi.fn().mockResolvedValue(undefined),
+      interrupt: vi.fn().mockResolvedValue(undefined),
     });
   }),
   getSessionMessages: vi.fn().mockResolvedValue([]),
@@ -190,33 +192,6 @@ describe('SdkSessionManager', () => {
     });
   });
 
-  describe('setEffortLevel', () => {
-    it('passes through low/medium/high directly', async () => {
-      for (const level of ['low', 'medium', 'high'] as const) {
-        const result = await sdk.setEffortLevel(SESSION_ID, level);
-        expect(result.applied).toBe(true);
-        expect(result.confirmedLevel).toBe(level);
-      }
-    });
-
-    it('maps max to high but confirms as max', async () => {
-      const result = await sdk.setEffortLevel(SESSION_ID, 'max');
-      expect(result.applied).toBe(true);
-      expect(result.confirmedLevel).toBe('max');
-    });
-
-    it('maps auto to undefined (reset to model default)', async () => {
-      const result = await sdk.setEffortLevel(SESSION_ID, 'auto');
-      expect(result.applied).toBe(true);
-      expect(result.confirmedLevel).toBe('auto');
-    });
-
-    it('returns false for non-existent session', async () => {
-      const result = await sdk.setEffortLevel('nonexistent', 'high');
-      expect(result.applied).toBe(false);
-    });
-  });
-
   describe('resolvePermission', () => {
     it('resolves allow without modifier — no updatedPermissions', async () => {
       const resultPromise = injectPendingPermission(sdk, SESSION_ID, 'tool_01', 'Bash');
@@ -262,6 +237,55 @@ describe('SdkSessionManager', () => {
       if (result.behavior === 'deny') {
         expect(result.message).toBe('User denied');
       }
+    });
+  });
+
+  describe('setEffortLevel', () => {
+    it('passes low/medium/high/xhigh through unchanged', async () => {
+      for (const level of ['low', 'medium', 'high', 'xhigh'] as const) {
+        const { applied, confirmedLevel } = await sdk.setEffortLevel(SESSION_ID, level);
+        expect(applied).toBe(true);
+        expect(confirmedLevel).toBe(level);
+      }
+    });
+
+    it('maps mid-session max → xhigh (true max needs a fresh session)', async () => {
+      const { applied, confirmedLevel } = await sdk.setEffortLevel(SESSION_ID, 'max');
+      expect(applied).toBe(true);
+      expect(confirmedLevel).toBe('xhigh');
+    });
+
+    it('resets to model default on auto', async () => {
+      const { applied, confirmedLevel } = await sdk.setEffortLevel(SESSION_ID, 'auto');
+      expect(applied).toBe(true);
+      expect(confirmedLevel).toBe('auto');
+    });
+
+    it('returns not-applied for an unknown session', async () => {
+      const { applied } = await sdk.setEffortLevel('nope', 'high');
+      expect(applied).toBe(false);
+    });
+  });
+
+  describe('setModel', () => {
+    it('applies a model and confirms it back', async () => {
+      const { applied, confirmedModel } = await sdk.setModel(SESSION_ID, 'claude-opus-4-8');
+      expect(applied).toBe(true);
+      expect(confirmedModel).toBe('claude-opus-4-8');
+      const sessions = (sdk as any).sessions as Map<string, any>;
+      expect(sessions.get(SESSION_ID).model).toBe('claude-opus-4-8');
+    });
+
+    it('returns not-applied for an unknown session', async () => {
+      const { applied, confirmedModel } = await sdk.setModel('nope', 'claude-opus-4-8');
+      expect(applied).toBe(false);
+      expect(confirmedModel).toBe('claude-opus-4-8');
+    });
+
+    it('reports the model in getSessions()', async () => {
+      await sdk.setModel(SESSION_ID, 'claude-sonnet-4-6');
+      const session = sdk.getSessions().find(s => s.id === SESSION_ID);
+      expect(session?.model).toBe('claude-sonnet-4-6');
     });
   });
 });

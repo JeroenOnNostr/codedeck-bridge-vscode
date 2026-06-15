@@ -141,13 +141,15 @@ export class BridgeCore {
           });
         }
       },
-      onCreateSession: async (defaultEffort?) => {
+      onCreateSession: async (defaultEffort?, model?) => {
         const sessionId = crypto.randomUUID();
-        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${defaultEffort ? ` (effort: ${defaultEffort})` : ''}`);
+        const effort = defaultEffort as EffortLevel | undefined;
+        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}`);
 
         try {
           const cwd = this.workspaceCwd || process.cwd();
-          this.sdk.createSession(sessionId, cwd, 'plan');
+          // Apply model + effort at query() construction so 'max'/'xhigh' take effect from the first turn.
+          this.sdk.createSession(sessionId, cwd, 'plan', model, effort);
 
           // Publish session-pending so the phone creates a placeholder
           await this.relay.publishSessionPending(sessionId);
@@ -155,7 +157,7 @@ export class BridgeCore {
           // Brief delay for relay rate-limiting
           await new Promise(resolve => setTimeout(resolve, 1_000));
 
-          // Build session info
+          // Build session info, seeding the effort/model the session was born with
           const project = cwd.split('/').pop() || cwd;
           const session: RemoteSessionInfo = {
             id: sessionId,
@@ -166,15 +168,9 @@ export class BridgeCore {
             title: null,
             project,
             permissionMode: 'plan',
+            effortLevel: effort,
+            model,
           };
-
-          // Apply default effort if requested
-          if (defaultEffort) {
-            const { applied, confirmedLevel } = await this.sdk.setEffortLevel(sessionId, defaultEffort);
-            if (applied) {
-              session.effortLevel = confirmedLevel as EffortLevel;
-            }
-          }
 
           // Publish session-ready
           log(`[Codedeck] Publishing session-ready for ${sessionId}`);
@@ -264,6 +260,14 @@ export class BridgeCore {
         // Always confirm back so the phone UI stays in sync, even if the level was unsupported
         this.relay.publishEffortConfirmed(sessionId, confirmedLevel).catch(err => {
           log(`[Codedeck] Failed to publish effort-confirmed: ${err}`);
+        });
+      },
+      onModelChange: async (sessionId, model) => {
+        log(`[Codedeck] Model change for session ${sessionId}: ${model}`);
+        const { confirmedModel } = await this.sdk.setModel(sessionId, model);
+        // Always confirm back so the phone UI stays in sync, even if the change failed
+        this.relay.publishModelConfirmed(sessionId, confirmedModel).catch(err => {
+          log(`[Codedeck] Failed to publish model-confirmed: ${err}`);
         });
       },
       onHistoryRequest: async (sessionId, afterSeq, _phonePubkey) => {
