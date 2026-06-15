@@ -16,13 +16,14 @@ import type {
   SDKUserMessage,
   SDKSystemMessage,
   SDKSessionStateChangedMessage,
+  SDKControlGetUsageResponse,
   PermissionResult,
   PermissionUpdate,
   PermissionMode,
   CanUseTool,
   Options,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { EffortLevel, OutputEntry, RemoteSessionInfo } from './types';
+import type { EffortLevel, OutputEntry, RemoteSessionInfo, UsageData, UsageWindow } from './types';
 import { sdkMessageToEntries } from './sdkAdapter';
 
 /**
@@ -47,6 +48,29 @@ function toOptionsEffort(effort?: EffortLevel): 'low' | 'medium' | 'high' | 'xhi
     default:
       return undefined; // 'auto' or unset → model default
   }
+}
+
+/**
+ * Project the SDK's structured `/usage` response into the lean `UsageData` we send over the wire.
+ * Tolerant of null/absent windows — the experimental SDK shape may omit any of them. A window is
+ * only included when the SDK reports it; null inner values are preserved so the phone can decide
+ * whether to render the row.
+ */
+export function normalizeUsage(res: SDKControlGetUsageResponse): UsageData {
+  const win = (w: { utilization: number | null; resets_at: string | null } | null | undefined): UsageWindow | undefined =>
+    w ? { utilization: w.utilization, resetsAt: w.resets_at } : undefined;
+
+  const rl = res.rate_limits;
+  return {
+    available: res.rate_limits_available,
+    subscriptionType: res.subscription_type ?? null,
+    fiveHour: win(rl?.five_hour),
+    sevenDay: win(rl?.seven_day),
+    sevenDayOpus: win(rl?.seven_day_opus),
+    sevenDaySonnet: win(rl?.seven_day_sonnet),
+    sessionCostUsd: typeof res.session?.total_cost_usd === 'number' ? res.session.total_cost_usd : undefined,
+    fetchedAt: new Date().toISOString(),
+  };
 }
 
 // --- Async input generator ---
@@ -453,6 +477,34 @@ export class SdkSessionManager {
       this.events.log(`[SDK] Failed to set model for ${sessionId}: ${err}`);
       // Confirm the previously-known model so the phone UI doesn't show a model that didn't take.
       return { applied: false, confirmedModel: session.model ?? model };
+    }
+  }
+
+  /**
+   * Fetch the structured subscription usage / rate-limit snapshot for a session — the
+   * same data the `/usage` command renders (5-hour, weekly, per-model windows + reset times).
+   *
+   * The underlying SDK method is EXPERIMENTAL (its verbose name signals it may change or be
+   * removed), so we feature-detect it and swallow any failure: callers get null and publish
+   * nothing rather than crashing. Returns null for dead/unknown sessions or unsupported SDKs.
+   */
+  async getUsage(sessionId: string): Promise<UsageData | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.alive) { return null; }
+
+    // The method name is intentionally unstable; reach it dynamically + feature-detect.
+    const q = session.query as unknown as {
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<SDKControlGetUsageResponse>;
+    };
+    const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+    if (typeof fn !== 'function') { return null; }
+
+    try {
+      const res = await fn.call(session.query);
+      return normalizeUsage(res);
+    } catch (err) {
+      this.events.log(`[SDK] getUsage failed for ${sessionId}: ${err}`);
+      return null;
     }
   }
 

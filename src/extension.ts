@@ -321,12 +321,30 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => clearInterval(timestampInterval) });
 
   // --- Heartbeat: re-publish session list every 60s so phones detect staleness ---
+  const USAGE_PUSH_ACTIVE_WINDOW_MS = 5 * 60_000; // only push usage for recently-active sessions
   const heartbeatInterval = setInterval(() => {
     if (bridgeCore?.relay.isConnected()) {
       const sessions = bridgeCore?.sdk.getSessions() ?? [];
       bridgeCore.relay.publishSessionList(sessions).catch(err => {
         console.error('[Codedeck] Heartbeat publish failed:', err);
       });
+
+      // Also push a subscription-usage snapshot for sessions active in the last few minutes,
+      // so the phone's usage badge stays current without the phone having to poll. Idle sessions
+      // are skipped to avoid needless SDK round-trips. getUsage() is null-safe (unsupported SDK /
+      // non-subscription / failure → nothing published).
+      const now = Date.now();
+      for (const s of sessions) {
+        const lastActive = Date.parse(s.lastActivity);
+        const recentlyActive = Number.isFinite(lastActive) && (now - lastActive) <= USAGE_PUSH_ACTIVE_WINDOW_MS;
+        if (s.state === 'running' || recentlyActive) {
+          bridgeCore.sdk.getUsage(s.id).then(usage => {
+            if (usage) {
+              bridgeCore?.relay.publishUsage(s.id, usage).catch(() => { /* best-effort */ });
+            }
+          }).catch(() => { /* best-effort */ });
+        }
+      }
     }
   }, 60_000);
   context.subscriptions.push({ dispose: () => clearInterval(heartbeatInterval) });

@@ -17,8 +17,12 @@ import type {
   RemoteSessionInfo,
   PairRequestMessage,
   PairAckMessage,
+  UsageRequestMessage,
+  UsageMessage,
+  UsageData,
 } from '../types';
 import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND, PROTOCOL_VERSION } from '../types';
+import { normalizeUsage } from '../sdkSession';
 
 describe('Protocol types', () => {
   describe('Event kinds', () => {
@@ -75,6 +79,10 @@ describe('Protocol types', () => {
 
     it('protocol version is at least 2 (auto-pairing support)', () => {
       expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(2);
+    });
+
+    it('protocol version is at least 3 (subscription usage support)', () => {
+      expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(3);
     });
 
     it('round-trips a pair-ack message (bridge → phone)', () => {
@@ -402,6 +410,91 @@ describe('Protocol types', () => {
       ];
 
       expect(tags.find(t => t[0] === 't')?.[1]).toBe('history');
+    });
+  });
+
+  describe('Subscription usage', () => {
+    it('round-trips a usage-request message (phone → bridge)', () => {
+      const msg: UsageRequestMessage = { type: 'usage-request', sessionId: 'sess-1' };
+      const parsed: BridgeInbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('usage-request');
+      if (parsed.type === 'usage-request') {
+        expect(parsed.sessionId).toBe('sess-1');
+      }
+    });
+
+    it('round-trips a usage message (bridge → phone)', () => {
+      const usage: UsageData = {
+        available: true,
+        subscriptionType: 'max',
+        fiveHour: { utilization: 42, resetsAt: '2026-06-15T18:00:00Z' },
+        sevenDay: { utilization: 18, resetsAt: '2026-06-20T08:00:00Z' },
+        sessionCostUsd: 1.23,
+        fetchedAt: '2026-06-15T12:00:00Z',
+      };
+      const msg: UsageMessage = { type: 'usage', sessionId: 'sess-1', usage };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('usage');
+      if (parsed.type === 'usage') {
+        expect(parsed.usage.available).toBe(true);
+        expect(parsed.usage.subscriptionType).toBe('max');
+        expect(parsed.usage.fiveHour?.utilization).toBe(42);
+        expect(parsed.usage.sevenDay?.resetsAt).toBe('2026-06-20T08:00:00Z');
+      }
+    });
+
+    it('normalizeUsage maps the SDK response into UsageData (subscription session)', () => {
+      const res = {
+        session: {
+          total_cost_usd: 2.5,
+          total_api_duration_ms: 0,
+          total_duration_ms: 0,
+          total_lines_added: 0,
+          total_lines_removed: 0,
+          model_usage: {},
+        },
+        subscription_type: 'max',
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: { utilization: 42, resets_at: '2026-06-15T18:00:00Z' },
+          seven_day: { utilization: 18, resets_at: '2026-06-20T08:00:00Z' },
+          seven_day_opus: { utilization: 60, resets_at: '2026-06-20T08:00:00Z' },
+          seven_day_sonnet: null,
+        },
+        behaviors: null,
+      } as unknown as Parameters<typeof normalizeUsage>[0];
+
+      const u = normalizeUsage(res);
+      expect(u.available).toBe(true);
+      expect(u.subscriptionType).toBe('max');
+      expect(u.sessionCostUsd).toBe(2.5);
+      expect(u.fiveHour).toEqual({ utilization: 42, resetsAt: '2026-06-15T18:00:00Z' });
+      expect(u.sevenDayOpus).toEqual({ utilization: 60, resetsAt: '2026-06-20T08:00:00Z' });
+      expect(u.sevenDaySonnet).toBeUndefined(); // null window → omitted
+      expect(typeof u.fetchedAt).toBe('string');
+    });
+
+    it('normalizeUsage handles a non-subscription (API-key) session', () => {
+      const res = {
+        session: {
+          total_cost_usd: 0,
+          total_api_duration_ms: 0,
+          total_duration_ms: 0,
+          total_lines_added: 0,
+          total_lines_removed: 0,
+          model_usage: {},
+        },
+        subscription_type: null,
+        rate_limits_available: false,
+        rate_limits: null,
+        behaviors: null,
+      } as unknown as Parameters<typeof normalizeUsage>[0];
+
+      const u = normalizeUsage(res);
+      expect(u.available).toBe(false);
+      expect(u.subscriptionType).toBeNull();
+      expect(u.fiveHour).toBeUndefined();
+      expect(u.sevenDay).toBeUndefined();
     });
   });
 });

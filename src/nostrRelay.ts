@@ -39,6 +39,7 @@ export interface NostrRelayEvents {
   onModeChange: (sessionId: string, mode: string) => void;
   onEffortChange: (sessionId: string, effort: string) => void;
   onModelChange: (sessionId: string, model: string) => void;
+  onUsageRequest: (sessionId: string) => void;
   onHistoryRequest: (sessionId: string, afterSeq: number | undefined, phonePubkey: string) => void;
   onCreateSession: (defaultEffort?: string, model?: string) => void;
   onRefreshSessions: () => void;
@@ -871,6 +872,16 @@ export class NostrRelay {
     return this.publishToAllPhones(msg, 30);
   }
 
+  /** Publish a subscription usage snapshot (NIP-40: expires in 90s — it's a poll snapshot, not an ack). */
+  async publishUsage(sessionId: string, usage: import('./types').UsageData): Promise<boolean> {
+    const msg: import('./types').UsageMessage = {
+      type: 'usage',
+      sessionId,
+      usage,
+    };
+    return this.publishToAllPhones(msg, 90);
+  }
+
   private static readonly HISTORY_CHUNK_SIZE = 20;
   private static readonly MAX_CHUNK_JSON_BYTES = 48_000;
   private static readonly CHUNK_DELAY_MS = 500;
@@ -1054,6 +1065,10 @@ export class NostrRelay {
         case 'model':
           Promise.resolve(this.events.onModelChange(msg.sessionId, msg.model))
             .catch(err => console.error('[Codedeck] onModelChange handler error:', err));
+          break;
+        case 'usage-request':
+          Promise.resolve(this.events.onUsageRequest(msg.sessionId))
+            .catch(err => console.error('[Codedeck] onUsageRequest handler error:', err));
           break;
         case 'history-request':
           this.events.onHistoryRequest(msg.sessionId, msg.afterSeq, event.pubkey);

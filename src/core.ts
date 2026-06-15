@@ -270,6 +270,14 @@ export class BridgeCore {
           log(`[Codedeck] Failed to publish model-confirmed: ${err}`);
         });
       },
+      onUsageRequest: async (sessionId) => {
+        const usage = await this.sdk.getUsage(sessionId);
+        // Unsupported SDK / non-subscription / fetch failure → publish nothing; phone keeps last value.
+        if (!usage) { return; }
+        this.relay.publishUsage(sessionId, usage).catch(err => {
+          log(`[Codedeck] Failed to publish usage: ${err}`);
+        });
+      },
       onHistoryRequest: async (sessionId, afterSeq, _phonePubkey) => {
         log(`[Codedeck] History request for ${sessionId} (afterSeq: ${afterSeq})`);
 

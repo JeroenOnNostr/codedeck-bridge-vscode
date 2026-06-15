@@ -257,6 +257,47 @@ export interface InterruptMessage {
   sessionId: string;
 }
 
+// --- Subscription usage / rate-limit windows ---
+
+/** A single claude.ai plan rate-limit window. `utilization` is 0-100 (percent of
+ *  the window consumed); `resetsAt` is an ISO 8601 timestamp. Either may be null
+ *  when the SDK reports the window but not its value. */
+export interface UsageWindow {
+  utilization: number | null;
+  resetsAt: string | null;
+}
+
+/** Normalized subscription usage snapshot — the bridge-friendly projection of the
+ *  Agent SDK's structured `/usage` response. We deliberately forward only the fields
+ *  the phone renders (not the raw, experimental SDK shape) to keep the protocol stable. */
+export interface UsageData {
+  /** Mirrors SDK `rate_limits_available`. False for API-key / Bedrock / Vertex sessions. */
+  available: boolean;
+  /** 'pro' | 'max' | 'team' | 'enterprise' or null for non-subscription sessions. */
+  subscriptionType: string | null;
+  fiveHour?: UsageWindow;
+  sevenDay?: UsageWindow;
+  sevenDayOpus?: UsageWindow;
+  sevenDaySonnet?: UsageWindow;
+  /** Accumulated cost of the current session in USD, when reported. */
+  sessionCostUsd?: number;
+  /** ISO timestamp (bridge clock) of when this snapshot was fetched — for "as of" + staleness. */
+  fetchedAt: string;
+}
+
+/** Phone → bridge: request a fresh usage snapshot for a session. */
+export interface UsageRequestMessage {
+  type: 'usage-request';
+  sessionId: string;
+}
+
+/** Bridge → phone: usage snapshot for a session. */
+export interface UsageMessage {
+  type: 'usage';
+  sessionId: string;
+  usage: UsageData;
+}
+
 // --- Credentials (phone → bridge) ---
 
 export interface SetCredentialsMessage {
@@ -298,17 +339,18 @@ export interface PairAckMessage {
 
 // --- Union ---
 
-export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | CredentialsAckMessage | PairAckMessage;
-export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | SetCredentialsMessage | PairRequestMessage;
+export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | UsageMessage | CredentialsAckMessage | PairAckMessage;
+export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | UsageRequestMessage | SetCredentialsMessage | PairRequestMessage;
 export type BridgeMessage = BridgeOutbound | BridgeInbound;
 
 /**
  * Bridge protocol version, advertised on the session list message.
  * v1 = supports per-session model selection (`model` / `model-confirmed`) and the widened
  * effort set (`xhigh`). v2 = supports the auto-pairing handshake (`pair-request` / `pair-ack`).
+ * v3 = supports subscription usage snapshots (`usage-request` / `usage`).
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // --- Nostr event kinds ---
 
