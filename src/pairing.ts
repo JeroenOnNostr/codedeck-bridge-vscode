@@ -29,7 +29,8 @@ export function showPairingPanel(
   );
 
   const relaysParam = pairingInfo.relays.map(r => encodeURIComponent(r)).join(',');
-  const pairingUrl = `codedeck://pair?npub=${pairingInfo.npub}&relays=${relaysParam}&machine=${encodeURIComponent(pairingInfo.machine)}`;
+  const tokenParam = pairingInfo.token ? `&token=${encodeURIComponent(pairingInfo.token)}` : '';
+  const pairingUrl = `codedeck://pair?npub=${pairingInfo.npub}&relays=${relaysParam}&machine=${encodeURIComponent(pairingInfo.machine)}${tokenParam}`;
 
   panel.webview.html = getPairingHtml(pairingUrl, pairingInfo);
 
@@ -122,37 +123,76 @@ function getPairingHtml(pairingUrl: string, info: PairingInfo): string {
     }
     button:hover { background: var(--vscode-button-hoverBackground); }
     .npub { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
+    .success {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      margin: 24px 0;
+      padding: 24px;
+      border-radius: 8px;
+      background: rgba(34, 197, 94, 0.12);
+      border: 1px solid rgba(34, 197, 94, 0.5);
+      width: 100%;
+      max-width: 500px;
+      box-sizing: border-box;
+    }
+    .success .check { font-size: 2.4em; color: #22c55e; line-height: 1; }
+    .success .title { font-size: 1.1em; font-weight: 600; }
+    #pairContent.hidden { display: none; }
   </style>
 </head>
 <body>
   <h1>Pair Codedeck Phone</h1>
-  <p class="info">Scan this with the Codedeck app, or copy the pairing URL below.</p>
 
-  <div class="qr-container">
-    ${generateQrSvg(pairingUrl)}
+  <div id="successBox" class="success">
+    <div class="check">✓</div>
+    <div class="title" id="successTitle">Phone paired!</div>
+    <p class="info">You can close this tab.</p>
   </div>
 
-  <p><strong>Pairing URL:</strong></p>
-  <div class="url-box">${escapeHtml(pairingUrl)}</div>
+  <div id="pairContent">
+    <p class="info">Scan this with your phone's camera, or copy the pairing URL below.</p>
 
-  <p><strong>Bridge npub:</strong></p>
-  <div class="url-box npub">${escapeHtml(info.npub)}</div>
+    <div class="qr-container">
+      ${generateQrSvg(pairingUrl)}
+    </div>
 
-  <p><strong>Machine:</strong> ${escapeHtml(info.machine)}</p>
-  <p><strong>Relays:</strong> ${info.relays.map(escapeHtml).join(', ')}</p>
+    <p><strong>Pairing URL:</strong></p>
+    <div class="url-box">${escapeHtml(pairingUrl)}</div>
 
-  <div class="section">
-    <h2>Manual Pairing</h2>
-    <p class="info" style="text-align: left;">
-      If you can't scan the QR code, paste the phone's npub below:
-    </p>
-    <input id="phoneNpub" placeholder="npub1..." />
-    <input id="phoneLabel" placeholder="Phone label (e.g., My Pixel)" />
-    <button onclick="manualPair()">Pair Phone</button>
+    <p><strong>Bridge npub:</strong></p>
+    <div class="url-box npub">${escapeHtml(info.npub)}</div>
+
+    <p><strong>Machine:</strong> ${escapeHtml(info.machine)}</p>
+    <p><strong>Relays:</strong> ${info.relays.map(escapeHtml).join(', ')}</p>
+
+    <div class="section">
+      <h2>Manual Pairing</h2>
+      <p class="info" style="text-align: left;">
+        Scanning should pair automatically. If it doesn't, paste the phone's npub below:
+      </p>
+      <input id="phoneNpub" placeholder="npub1..." />
+      <input id="phoneLabel" placeholder="Phone label (e.g., My Pixel)" />
+      <button onclick="manualPair()">Pair Phone</button>
+    </div>
   </div>
 
   <script>
     const vscode = acquireVsCodeApi();
+
+    // The extension posts { command: 'paired', label } when an auto-pair succeeds.
+    window.addEventListener('message', (e) => {
+      const data = e.data || {};
+      if (data.command === 'paired') {
+        const title = document.getElementById('successTitle');
+        if (title) title.textContent = 'Phone "' + (data.label || 'Phone') + '" paired!';
+        const box = document.getElementById('successBox');
+        if (box) box.style.display = 'flex';
+        const content = document.getElementById('pairContent');
+        if (content) content.classList.add('hidden');
+      }
+    });
 
     function manualPair() {
       const npub = document.getElementById('phoneNpub').value.trim();

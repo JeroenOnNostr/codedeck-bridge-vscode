@@ -20,6 +20,8 @@ import type {
   BridgeOutbound,
   BridgeInbound,
   PairedPhone,
+  PairRequestMessage,
+  PairAckMessage,
   OutputEntry,
   RemoteSessionInfo,
   SessionPendingMessage,
@@ -102,6 +104,16 @@ export class NostrRelay {
   // Ensures each session list event has a strictly newer created_at than the previous one,
   // preventing "replaced: have newer event" rejections from relays.
   private lastSessionListTimestamp = 0;
+
+  // --- Auto-pairing window ---
+  // A dedicated, time-boxed subscription with NO `authors` filter, opened only
+  // while the user has the pairing panel open. This is the only path by which an
+  // as-yet-unpaired phone can reach the bridge; a one-time token gates acceptance.
+  private pairingSubscription: ReturnType<SimplePool['subscribeMany']> | null = null;
+  private pairingToken: string | null = null;
+  private pairingWindowTimer: ReturnType<typeof setTimeout> | null = null;
+  private pairingPoolWasCreated = false; // true if we created the pool solely for pairing
+  private onPairRequest?: (req: PairRequestMessage, fromPubkey: string) => void;
 
   constructor(
     secretKey: Uint8Array,
@@ -242,6 +254,7 @@ export class NostrRelay {
   /** Permanently shut down — prevents reconnection attempts after extension deactivation. */
   dispose(): void {
     this.disposed = true;
+    this.closePairingWindow();
     this.disconnect();
     this.processedEventIds.clear();
   }
@@ -261,6 +274,133 @@ export class NostrRelay {
     this.pairedPhones = phones;
     if (this.isConnected()) {
       this.connect(); // Reconnect with updated authors filter
+    }
+  }
+
+  // --- Auto-pairing window ---
+
+  /**
+   * Open a time-boxed pairing window. Subscribes (with NO `authors` filter) for
+   * encrypted pair-request events tagged to this bridge, so a not-yet-paired
+   * phone can reach us. Accepts only requests echoing `token`. Auto-closes after
+   * `durationMs`. Idempotent-ish: re-opening replaces the prior window.
+   */
+  openPairingWindow(
+    token: string,
+    durationMs: number,
+    onPairRequest: (req: PairRequestMessage, fromPubkey: string) => void,
+  ): void {
+    this.closePairingWindow();
+
+    this.pairingToken = token;
+    this.onPairRequest = onPairRequest;
+
+    // First-ever pairing has zero phones, so connect() never created a pool.
+    // Ensure one exists for the duration of the window.
+    if (!this.pool) {
+      this.pool = new SimplePool({ enableReconnect: true });
+      this.pairingPoolWasCreated = true;
+    }
+
+    try {
+      this.pairingSubscription = this.pool.subscribeMany(
+        this.relays,
+        {
+          kinds: [OUTPUT_EVENT_KIND],
+          '#p': [this.pubkeyHex],
+          since: Math.floor(Date.now() / 1000) - 5,
+          // NOTE: intentionally NO `authors` filter — that's the whole point.
+        },
+        {
+          onevent: (event) => { this.handlePairingEvent(event); },
+          oneose: () => { this.log('[Codedeck] Pairing window open — listening for pair requests'); },
+          onclose: (reasons) => { this.log(`[Codedeck] Pairing subscription closed: ${JSON.stringify(reasons)}`); },
+        },
+      );
+      this.log(`[Codedeck] Pairing window opened for ${Math.round(durationMs / 1000)}s`);
+    } catch (err) {
+      this.log(`[Codedeck] Failed to open pairing window: ${err}`);
+    }
+
+    this.pairingWindowTimer = setTimeout(() => {
+      this.log('[Codedeck] Pairing window expired');
+      this.closePairingWindow();
+    }, durationMs);
+  }
+
+  /** Close the pairing window and tear down its dedicated subscription/pool. */
+  closePairingWindow(): void {
+    if (this.pairingWindowTimer) {
+      clearTimeout(this.pairingWindowTimer);
+      this.pairingWindowTimer = null;
+    }
+    if (this.pairingSubscription) {
+      this.pairingSubscription.close();
+      this.pairingSubscription = null;
+    }
+    this.pairingToken = null;
+    this.onPairRequest = undefined;
+
+    // If we created the pool solely for pairing and there are still no paired
+    // phones (so the main subscription isn't using it), destroy it.
+    if (this.pairingPoolWasCreated && this.subscription === null && this.pairedPhones.length === 0 && this.pool) {
+      this.pool.destroy();
+      this.pool = null;
+    }
+    this.pairingPoolWasCreated = false;
+  }
+
+  /** Handle an event received on the no-`authors` pairing subscription. */
+  private handlePairingEvent(event: { id: string; pubkey: string; content: string; created_at: number }): void {
+    if (this.processedEventIds.has(event.id)) { return; }
+    this.processedEventIds.add(event.id);
+    if (this.processedEventIds.size > NostrRelay.MAX_PROCESSED_EVENT_IDS) {
+      const first = this.processedEventIds.values().next().value;
+      if (first !== undefined) { this.processedEventIds.delete(first); }
+    }
+
+    let msg: BridgeInbound;
+    try {
+      // Junk from the open filter (e.g. events we can't decrypt) is dropped here.
+      const conversationKey = getConversationKey(this.secretKey, event.pubkey);
+      const plaintext = decrypt(event.content, conversationKey);
+      msg = JSON.parse(plaintext);
+    } catch {
+      return; // not for us / not decryptable — ignore silently
+    }
+
+    if (msg.type !== 'pair-request') { return; }
+
+    if (!this.pairingToken || msg.token !== this.pairingToken) {
+      this.log(`[Codedeck] Rejecting pair-request from ${event.pubkey.slice(0, 8)}… — bad token`);
+      this.sendPairAck(event.pubkey, this.machineName, false, 'bad-token').catch(() => { /* best-effort */ });
+      return;
+    }
+
+    this.log(`[Codedeck] Valid pair-request from "${msg.label}" (${event.pubkey.slice(0, 8)}…)`);
+    this.onPairRequest?.(msg, event.pubkey);
+  }
+
+  /** Send a pair-ack to an explicit (possibly not-yet-paired) phone pubkey. */
+  async sendPairAck(phonePubkeyHex: string, machine: string, ok: boolean, reason?: PairAckMessage['reason']): Promise<void> {
+    if (!this.pool) { return; }
+    const msg: PairAckMessage = reason
+      ? { type: 'pair-ack', machine, ok, reason }
+      : { type: 'pair-ack', machine, ok };
+    try {
+      const conversationKey = getConversationKey(this.secretKey, phonePubkeyHex);
+      const ciphertext = encrypt(JSON.stringify(msg), conversationKey);
+      const event = finalizeEvent({
+        kind: OUTPUT_EVENT_KIND,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['p', phonePubkeyHex]],
+        content: ciphertext,
+      }, this.secretKey);
+      const results = this.pool.publish(this.relays, event);
+      await Promise.allSettled(results);
+      this.log(`[Codedeck] Sent pair-ack (ok=${ok}) to ${phonePubkeyHex.slice(0, 8)}…`);
+    } catch (err) {
+      this.log(`[Codedeck] Failed to send pair-ack: ${err}`);
     }
   }
 

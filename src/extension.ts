@@ -10,6 +10,7 @@
 
 import * as vscode from 'vscode';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import * as nip19 from 'nostr-tools/nip19';
 import { BridgeCore } from './core';
 import { NostrRelay } from './nostrRelay';
@@ -21,7 +22,10 @@ import {
   loadSecretKey,
   saveSecretKey,
 } from './pairing';
-import type { PairedPhone } from './types';
+import type { PairedPhone, PairRequestMessage } from './types';
+
+/** How long an open pairing window accepts auto pair-requests. */
+const PAIRING_WINDOW_MS = 180_000;
 
 let bridgeCore: BridgeCore | undefined;
 let statusBar: StatusBar | undefined;
@@ -97,17 +101,62 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar.setReady(0);
   }
 
+  // --- Helper: add a phone to the paired list (shared by manual + auto pairing) ---
+  // Returns true if newly added, false if it was already paired or failed.
+  const addPairedPhone = async (pubkeyHex: string, label: string): Promise<boolean> => {
+    const phones = loadPairedPhones(context);
+    if (phones.some(p => p.pubkeyHex === pubkeyHex)) {
+      return false; // already paired (idempotent)
+    }
+
+    const phone: PairedPhone = {
+      npub: nip19.npubEncode(pubkeyHex),
+      pubkeyHex,
+      label,
+      pairedAt: new Date().toISOString(),
+    };
+    phones.push(phone);
+
+    try {
+      await savePairedPhones(context, phones);
+    } catch (err) {
+      console.error('[Codedeck] Failed to save paired phones:', err);
+      vscode.window.showErrorMessage('Codedeck: Failed to save phone pairing');
+      return false;
+    }
+
+    bridgeCore?.relay.updatePairedPhones(phones);
+    if (!bridgeCore?.relay.isConnected()) {
+      statusBar?.setConnecting();
+      bridgeCore?.connect();
+    }
+    statusBar?.setReady(phones.length);
+
+    // Send current session list to the new phone
+    const sessions = bridgeCore?.sdk.getSessions() ?? [];
+    bridgeCore?.relay.publishSessionList(sessions).catch(err => {
+      console.error('[Codedeck] Failed to publish session list:', err);
+    });
+    return true;
+  };
+
   // --- Helper: open pairing panel ---
   const openPairingPanel = () => {
     if (!bridgeCore) { return; }
 
-    showPairingPanel(
+    // One-time token embedded in this session's QR; the phone echoes it back in
+    // its pair-request and the bridge accepts only a matching token.
+    const token = crypto.randomBytes(16).toString('hex');
+
+    const panel = showPairingPanel(
       context,
       {
         npub: bridgeCore.relay.npub,
         relays,
         machine: machineName,
+        token,
       },
+      // Manual fallback: user pastes the phone's npub into the webview form.
       async (pubkeyInput: string, label: string) => {
         let pubkeyHex: string;
         if (pubkeyInput.startsWith('npub1')) {
@@ -126,42 +175,31 @@ export function activate(context: vscode.ExtensionContext): void {
           pubkeyHex = pubkeyInput;
         }
 
-        const phone: PairedPhone = {
-          npub: nip19.npubEncode(pubkeyHex),
-          pubkeyHex,
-          label,
-          pairedAt: new Date().toISOString(),
-        };
-
-        const phones = loadPairedPhones(context);
-        if (phones.some(p => p.pubkeyHex === pubkeyHex)) {
+        const added = await addPairedPhone(pubkeyHex, label);
+        if (!added) {
           vscode.window.showInformationMessage(`Phone "${label}" is already paired`);
-          return;
         }
-
-        phones.push(phone);
-        try {
-          await savePairedPhones(context, phones);
-        } catch (err) {
-          console.error('[Codedeck] Failed to save paired phones:', err);
-          vscode.window.showErrorMessage('Codedeck: Failed to save phone pairing');
-          return;
-        }
-
-        bridgeCore?.relay.updatePairedPhones(phones);
-        if (!bridgeCore?.relay.isConnected()) {
-          statusBar?.setConnecting();
-          bridgeCore?.connect();
-        }
-        statusBar?.setReady(phones.length);
-
-        // Send current session list to the new phone
-        const sessions = bridgeCore?.sdk.getSessions() ?? [];
-        bridgeCore?.relay.publishSessionList(sessions).catch(err => {
-          console.error('[Codedeck] Failed to publish session list:', err);
-        });
       },
     );
+
+    // Auto-pairing: open a time-boxed window that listens for the phone's
+    // pair-request and pairs it without any manual npub entry.
+    bridgeCore.relay.openPairingWindow(token, PAIRING_WINDOW_MS, async (req: PairRequestMessage, fromPubkey: string) => {
+      const label = req.label || 'Phone';
+      // Close the pairing window first so its subscription is torn down on the
+      // current pool BEFORE addPairedPhone reconnects (which destroys that pool).
+      bridgeCore?.relay.closePairingWindow();
+      await addPairedPhone(fromPubkey, label);
+      // After the reconnect, the relay has a fresh pool that can send the ack.
+      await bridgeCore?.relay.sendPairAck(fromPubkey, machineName, true);
+      vscode.window.showInformationMessage(`Codedeck: Phone "${label}" paired!`);
+      panel.webview.postMessage({ command: 'paired', label });
+    });
+
+    // Closing the QR tab also closes the no-authors pairing subscription.
+    panel.onDidDispose(() => {
+      bridgeCore?.relay.closePairingWindow();
+    });
   };
 
   // --- Register commands ---

@@ -1,5 +1,9 @@
 # Done — Codedeck Bridge (VSCode Extension)
 
+## Zero-Touch Auto-Pairing (2026-06-15, v2026.6.16)
+
+- [x] **CDB-020: Token-gated auto-pairing window** — The phone now pairs with no manual npub paste. The QR carries a fresh one-time `token`; opening the pairing panel arms a 3-minute, no-`authors` subscription (`openPairingWindow`/`handlePairingEvent`/`closePairingWindow` in `nostrRelay.ts`) — the only path by which an as-yet-unpaired phone can reach the bridge. A valid token-matched `pair-request` auto-adds the phone, re-subscribes, sends an encrypted `pair-ack`, toasts "Phone X paired!", and flips the webview to a success state. `extension.ts` mints the token + shares one `addPairedPhone()` across the auto and manual paths; manual npub paste stays as a fallback. `PROTOCOL_VERSION` bumped 1→2. Security: token travels only inside the NIP-44 payload, the window is user-initiated + time-boxed, and the toast names the paired device — strictly stronger than the old paste-any-npub flow. New `pair-request`/`pair-ack` protocol types + round-trip tests.
+
 ## SDK Upgrade, Effort & Model Control (2026-06-15, v0.6.0)
 
 - [x] **CDB-010: Upgrade Agent SDK 0.2.92 → 0.3.177** — Low-risk bump (we use only `setPermissionMode`/`interrupt`/`applyFlagSettings`, none of the removed V2/TodoWrite/maxThinkingTokens APIs). Only breakage: `session_state_changed` is now its own `SDKSessionStateChangedMessage` type (was a `SDKSystemMessage` subtype) — fixed the comparison in `sdkSession.ts`. NOTE: `npm install` requires `--legacy-peer-deps` (SDK 0.3.x declares `@anthropic-ai/sdk` as a peer; it's types-only at our usage and marked external in esbuild).

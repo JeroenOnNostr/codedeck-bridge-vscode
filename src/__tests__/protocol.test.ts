@@ -15,6 +15,8 @@ import type {
   HistoryRequestMessage,
   OutputEntry,
   RemoteSessionInfo,
+  PairRequestMessage,
+  PairAckMessage,
 } from '../types';
 import { SESSION_LIST_EVENT_KIND, OUTPUT_EVENT_KIND, PROTOCOL_VERSION } from '../types';
 
@@ -68,6 +70,27 @@ describe('Protocol types', () => {
       const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
       if (parsed.type === 'sessions') {
         expect(parsed.protocolVersion).toBe(PROTOCOL_VERSION);
+      }
+    });
+
+    it('protocol version is at least 2 (auto-pairing support)', () => {
+      expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(2);
+    });
+
+    it('round-trips a pair-ack message (bridge → phone)', () => {
+      const ok: PairAckMessage = { type: 'pair-ack', machine: 'laptop', ok: true };
+      const parsedOk: BridgeOutbound = JSON.parse(JSON.stringify(ok));
+      expect(parsedOk.type).toBe('pair-ack');
+      if (parsedOk.type === 'pair-ack') {
+        expect(parsedOk.ok).toBe(true);
+        expect(parsedOk.machine).toBe('laptop');
+      }
+
+      const bad: PairAckMessage = { type: 'pair-ack', machine: 'laptop', ok: false, reason: 'bad-token' };
+      const parsedBad: BridgeOutbound = JSON.parse(JSON.stringify(bad));
+      if (parsedBad.type === 'pair-ack') {
+        expect(parsedBad.ok).toBe(false);
+        expect(parsedBad.reason).toBe('bad-token');
       }
     });
 
@@ -159,6 +182,24 @@ describe('Protocol types', () => {
   });
 
   describe('Bridge inbound messages (phone → bridge)', () => {
+    it('round-trips a pair-request message', () => {
+      const msg: PairRequestMessage = {
+        type: 'pair-request',
+        npub: 'npub1xyz',
+        pubkeyHex: 'a'.repeat(64),
+        label: 'Codedeck Phone',
+        token: 'deadbeefdeadbeefdeadbeefdeadbeef',
+      };
+
+      const parsed: BridgeInbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('pair-request');
+      if (parsed.type === 'pair-request') {
+        expect(parsed.pubkeyHex).toBe('a'.repeat(64));
+        expect(parsed.label).toBe('Codedeck Phone');
+        expect(parsed.token).toBe('deadbeefdeadbeefdeadbeefdeadbeef');
+      }
+    });
+
     it('serializes input message', () => {
       const msg: InputMessage = {
         type: 'input',

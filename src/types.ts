@@ -275,18 +275,40 @@ export interface CredentialsAckMessage {
   error?: string;
 }
 
+// --- Auto-pairing handshake ---
+
+/** Phone → bridge: request to pair, sent right after the phone ingests the QR
+ *  deep-link. Carries the phone's own identity plus the one-time token embedded
+ *  in this pairing session's QR. Only accepted while a pairing window is open. */
+export interface PairRequestMessage {
+  type: 'pair-request';
+  npub: string;
+  pubkeyHex: string;
+  label: string;   // device label, e.g. "Codedeck Phone"
+  token: string;   // one-time token echoed from the QR
+}
+
+/** Bridge → phone: pairing result. */
+export interface PairAckMessage {
+  type: 'pair-ack';
+  machine: string;
+  ok: boolean;
+  reason?: 'bad-token' | 'window-closed';
+}
+
 // --- Union ---
 
-export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | CredentialsAckMessage;
-export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | SetCredentialsMessage;
+export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | CredentialsAckMessage | PairAckMessage;
+export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | SetCredentialsMessage | PairRequestMessage;
 export type BridgeMessage = BridgeOutbound | BridgeInbound;
 
 /**
  * Bridge protocol version, advertised on the session list message.
  * v1 = supports per-session model selection (`model` / `model-confirmed`) and the widened
- * effort set (`xhigh`). A phone uses this to gate features against older bridges.
+ * effort set (`xhigh`). v2 = supports the auto-pairing handshake (`pair-request` / `pair-ack`).
+ * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // --- Nostr event kinds ---
 
@@ -304,6 +326,8 @@ export interface PairingInfo {
   npub: string;
   relays: string[];
   machine: string;
+  /** One-time pairing token embedded in the QR for the auto-pairing handshake. */
+  token?: string;
 }
 
 export interface PairedPhone {
