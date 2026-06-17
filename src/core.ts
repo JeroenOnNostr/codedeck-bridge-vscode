@@ -15,6 +15,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { NostrRelay, NostrRelayEvents } from './nostrRelay';
 import { SdkSessionManager } from './sdkSession';
+import { buildScreenshotEntry } from './screenshotDelivery';
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, PairedPhone, UploadImageBlossomMessage, UploadImageChunkMessage } from './types';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
@@ -118,6 +119,19 @@ export class BridgeCore {
       log,
     });
 
+    // Deliver device screenshots (captured by the test-session MCP tools) to the phone inline.
+    // Downscales then publishes as a tool_result output entry with an image data-URI in metadata.
+    this.sdk.onDeviceScreenshot = async (sessionId, artifactPath, serial) => {
+      const built = buildScreenshotEntry(artifactPath, serial);
+      if (!built) return 'capture saved but image could not be read';
+      await this.relay.publishOutput(sessionId, [{ seq: 0, entry: built.entry as OutputEntry }]).catch((err) => {
+        console.error('[Codedeck] Failed to publish screenshot:', err);
+      });
+      // Best-effort cleanup of the on-disk artifact (it's already delivered).
+      try { require('fs').unlinkSync(artifactPath); } catch { /* ignore */ }
+      return `delivered to phone (${Math.round(built.sizeBytes / 1024)} KB)`;
+    };
+
     // --- Nostr relay events (phone → bridge) ---
     const relayEvents: NostrRelayEvents = {
       onInput: async (sessionId, text, _phonePubkey) => {
@@ -141,15 +155,16 @@ export class BridgeCore {
           });
         }
       },
-      onCreateSession: async (defaultEffort?, model?) => {
+      onCreateSession: async (defaultEffort?, model?, testSession?) => {
         const sessionId = crypto.randomUUID();
         const effort = defaultEffort as EffortLevel | undefined;
-        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}`);
+        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}${testSession ? ' [test session: device tools enabled]' : ''}`);
 
         try {
           const cwd = this.workspaceCwd || process.cwd();
           // Apply model + effort at query() construction so 'max'/'xhigh' take effect from the first turn.
-          this.sdk.createSession(sessionId, cwd, 'plan', model, effort);
+          // testSession attaches the on-device adb MCP tools (Phase 2.3).
+          this.sdk.createSession(sessionId, cwd, 'plan', model, effort, { testSession: !!testSession });
 
           // Publish session-pending so the phone creates a placeholder
           await this.relay.publishSessionPending(sessionId);
@@ -325,6 +340,18 @@ export class BridgeCore {
         } else {
           const chunk = msg as UploadImageChunkMessage;
           this.handleImageChunk(chunk.sessionId, chunk.uploadId, chunk.filename, chunk.mimeType, chunk.base64Data, chunk.text, chunk.chunkIndex, chunk.totalChunks);
+        }
+      },
+      onSetDeviceConfig: (deviceConfig, _phonePubkey) => {
+        // Persist to .codedeck/device-config.json in the workspace, so both the bridge and the
+        // autonomous test-session (running Claude Code in the workspace) can read it.
+        try {
+          const dir = path.join(this.workspaceCwd || '.', '.codedeck');
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'device-config.json'), JSON.stringify(deviceConfig, null, 2));
+          log(`[Codedeck] Device config saved: ${deviceConfig.label} (${deviceConfig.serial}, app=${deviceConfig.appUnderTest})`);
+        } catch (err) {
+          log(`[Codedeck] Failed to save device config: ${err}`);
         }
       },
     };

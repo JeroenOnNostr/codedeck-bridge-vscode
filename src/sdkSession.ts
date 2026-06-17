@@ -10,6 +10,9 @@
  */
 
 import { query, getSessionMessages } from '@anthropic-ai/claude-agent-sdk';
+import * as os from 'os';
+import * as path from 'path';
+import { createDeviceMcpServer } from './deviceActions';
 import type {
   Query,
   SDKMessage,
@@ -31,6 +34,23 @@ import { sdkMessageToEntries } from './sdkAdapter';
  * overloaded or unavailable, the SDK degrades to this rather than failing the turn.
  */
 const FALLBACK_MODEL = 'claude-sonnet-4-6';
+
+/**
+ * Secret-bearing paths a device-test session must never read (signing keystores + their cleartext
+ * password files + env files). Matched case-insensitively anywhere in a tool's string arguments.
+ * This is the enforced half of the SKILL.md "dev builds only, never touch release keystores" rule.
+ */
+const SECRET_PATH_RE = /(\.keystore|\.jks|\.p12|\.pfx|key\.properties|keystore\.properties|(?<![A-Za-z0-9])\.env)(?![A-Za-z0-9])/i;
+
+/** Tools whose arguments can name a filesystem path / shell command we should screen. */
+const PATH_BEARING_TOOLS = new Set(['Read', 'Bash', 'Grep', 'Glob', 'Edit', 'Write', 'NotebookEdit']);
+
+/** True if a (test-session) tool call references a secret-bearing path in any of its string args. */
+export function touchesSecretPath(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (!PATH_BEARING_TOOLS.has(toolName)) return false;
+  const haystack = JSON.stringify(toolInput ?? {});
+  return SECRET_PATH_RE.test(haystack);
+}
 
 /**
  * Map a phone effort level to the SDK's Options.effort value (used at query() construction).
@@ -150,6 +170,9 @@ interface ManagedSession {
   seqCounter: number;
   cwd: string;
   permissionMode: PermissionMode;
+  /** True when this session has the on-device adb MCP tools (device-test session). Used to enforce
+   *  the secret-path deny-list below, regardless of permission mode. */
+  testSession?: boolean;
   /** Phone-level effort (e.g. 'high', 'max') — tracked so getSessions() can report it. */
   effortLevel?: EffortLevel;
   /** Selected Claude model ID (e.g. 'claude-opus-4-8') — tracked so getSessions() can report it and resume can re-apply it. */
@@ -196,6 +219,13 @@ export class SdkSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private events: SdkSessionEvents;
 
+  /**
+   * Optional hook: deliver a captured device screenshot to the phone (Phase 3 wires this to the
+   * bridge→phone image path). Returns a short human-readable note for the tool result.
+   * Set by BridgeCore after construction.
+   */
+  public onDeviceScreenshot?: (sessionId: string, artifactPath: string, serial: string) => Promise<string>;
+
   constructor(events: SdkSessionEvents) {
     this.events = events;
   }
@@ -212,6 +242,7 @@ export class SdkSessionManager {
     initialPermissionMode: PermissionMode = 'plan',
     model?: string,
     effort?: EffortLevel,
+    opts?: { testSession?: boolean },
   ): void {
     if (this.sessions.has(sessionId)) {
       this.events.log(`[SDK] Session ${sessionId} already exists`);
@@ -228,6 +259,7 @@ export class SdkSessionManager {
       seqCounter: 0,
       cwd,
       permissionMode: initialPermissionMode,
+      testSession: !!opts?.testSession,
       effortLevel: effort,
       model,
       history: [],
@@ -248,6 +280,20 @@ export class SdkSessionManager {
     };
 
     const optionsEffort = toOptionsEffort(effort);
+
+    // Test sessions get the on-device adb MCP tools (install/launch/logcat/screenshot/tap/...).
+    // Normal coding sessions do NOT, keeping device control off the default surface.
+    const mcpServers = opts?.testSession
+      ? {
+          device: createDeviceMcpServer({
+            artifactDir: path.join(os.tmpdir(), 'codedeck-device-artifacts'),
+            onScreenshot: this.onDeviceScreenshot
+              ? (artifactPath, serial) => this.onDeviceScreenshot!(sessionId, artifactPath, serial)
+              : undefined,
+          }),
+        }
+      : undefined;
+
     const options: Options = {
       sessionId,
       cwd,
@@ -260,6 +306,7 @@ export class SdkSessionManager {
       fallbackModel: FALLBACK_MODEL,
       ...(model ? { model } : {}),
       ...(optionsEffort ? { effort: optionsEffort } : {}),
+      ...(mcpServers ? { mcpServers } : {}),
     };
     this.events.log(`[SDK] Creating session ${sessionId} (model: ${model ?? 'default'}, effort: ${optionsEffort ?? 'default'})`);
 
@@ -867,6 +914,18 @@ export class SdkSessionManager {
     toolInput: Record<string, unknown>,
     options: Parameters<CanUseTool>[2],
   ): Promise<PermissionResult> {
+    // SECURITY: device-test sessions run with full Read/Bash/Grep and (in YOLO mode) auto-approve.
+    // Hard-deny any tool call that touches signing keystores / secret files, BEFORE the mode check,
+    // so a prompt-injected or confused test agent can never exfiltrate release keys through the
+    // Nostr output channel. This is an enforced control, not a prose guideline. Mode-independent.
+    if (session.testSession && touchesSecretPath(toolName, toolInput)) {
+      this.events.log(`[SDK] DENIED secret-path access by test session ${sessionId}: ${toolName}`);
+      return Promise.resolve({
+        behavior: 'deny',
+        message: 'Blocked: device-test sessions may not read signing keystores or secret files (keystore/.jks/.p12/key.properties/keystore.properties/.env). This is a hard security boundary.',
+      });
+    }
+
     // AskUserQuestion: block until the user answers on the phone.
     // The SDK expects answers via updatedInput.answers (keyed by question header).
     // Question entries appear in the output stream via sdkAdapter, and the phone

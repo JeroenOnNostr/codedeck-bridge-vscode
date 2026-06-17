@@ -41,11 +41,12 @@ export interface NostrRelayEvents {
   onModelChange: (sessionId: string, model: string) => void;
   onUsageRequest: (sessionId: string) => void;
   onHistoryRequest: (sessionId: string, afterSeq: number | undefined, phonePubkey: string) => void;
-  onCreateSession: (defaultEffort?: string, model?: string) => void;
+  onCreateSession: (defaultEffort?: string, model?: string, testSession?: boolean) => void;
   onRefreshSessions: () => void;
   onCloseSession: (sessionId: string) => void;
   onInterrupt: (sessionId: string) => void;
   onUploadImage: (msg: import('./types').UploadImageMessage, phonePubkey: string) => void;
+  onSetDeviceConfig: (config: import('./types').DeviceConfig, phonePubkey: string) => void;
 }
 
 export class NostrRelay {
@@ -85,6 +86,11 @@ export class NostrRelay {
   private static readonly OUTPUT_FLUSH_INTERVAL_MS = 1_000;
   private static readonly OUTPUT_INTER_EVENT_DELAY_MS = 100;
   private static readonly MAX_EVENTS_PER_FLUSH = 5;
+  // NIP-40 expiration for device-screenshot output events. Screenshots of a test app can incidentally
+  // capture sensitive UI; they're NIP-44-encrypted to the phone but otherwise persist on public relays
+  // indefinitely. Give them a short TTL so they self-expire (the phone only needs them transiently).
+  // Regular text output keeps no expiration so session-history catch-up still works.
+  private static readonly SCREENSHOT_EXPIRATION_SECS = 2 * 24 * 60 * 60; // 2 days
 
   // --- Output publish priority ---
   // Pause output flushing while a high-priority publish is in progress.
@@ -650,14 +656,22 @@ export class NostrRelay {
           const conversationKey = getConversationKey(this.secretKey, phone.pubkeyHex);
           const ciphertext = encrypt(json, conversationKey);
 
+          // Device screenshots get a NIP-40 expiration so the (potentially sensitive) image blobs
+          // self-expire off public relays; plain output stays unexpired for history catch-up.
+          const isScreenshot = (entry as { metadata?: Record<string, unknown> })?.metadata?.special === 'device_screenshot';
+          const tags: string[][] = [
+            ['p', phone.pubkeyHex],
+            ['s', sessionId],   // session tag for filtering
+            ['seq', String(seq)], // sequence number for ordering
+          ];
+          if (isScreenshot) {
+            tags.push(['expiration', String(Math.floor(Date.now() / 1000) + NostrRelay.SCREENSHOT_EXPIRATION_SECS)]);
+          }
+
           const event = finalizeEvent({
             kind: OUTPUT_EVENT_KIND,
             created_at: Math.floor(Date.now() / 1000),
-            tags: [
-              ['p', phone.pubkeyHex],
-              ['s', sessionId],   // session tag for filtering
-              ['seq', String(seq)], // sequence number for ordering
-            ],
+            tags,
             content: ciphertext,
           }, this.secretKey);
 
@@ -1074,7 +1088,7 @@ export class NostrRelay {
           this.events.onHistoryRequest(msg.sessionId, msg.afterSeq, event.pubkey);
           break;
         case 'create-session':
-          Promise.resolve(this.events.onCreateSession(msg.defaultEffort, msg.model))
+          Promise.resolve(this.events.onCreateSession(msg.defaultEffort, msg.model, msg.testSession))
             .catch(err => this.log(`[Codedeck] onCreateSession handler error: ${err}`));
           break;
         case 'refresh-sessions':
@@ -1091,6 +1105,10 @@ export class NostrRelay {
           break;
         case 'upload-image':
           this.events.onUploadImage(msg, event.pubkey);
+          break;
+        case 'set-device-config':
+          Promise.resolve(this.events.onSetDeviceConfig(msg.config, event.pubkey))
+            .catch(err => this.log(`[Codedeck] onSetDeviceConfig handler error: ${err}`));
           break;
         default:
           this.log(`[Codedeck] Ignoring unhandled message type: ${(msg as any).type}`);

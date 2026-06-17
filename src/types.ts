@@ -141,6 +141,11 @@ export interface CreateSessionMessage {
   defaultEffort?: EffortLevel;
   /** Claude model ID for the new session (e.g. 'claude-opus-4-8'). */
   model?: string;
+  /**
+   * When true, attach the on-device test MCP tools (adb install/launch/logcat/screenshot/tap/...)
+   * to this session. Only test sessions get device control; normal coding sessions do not.
+   */
+  testSession?: boolean;
 }
 
 // --- Refresh sessions (phone → bridge) ---
@@ -306,6 +311,28 @@ export interface SetCredentialsMessage {
   githubPat?: string | null;
 }
 
+/** Test-device config sent from the phone (mirrors codedeck/src/types.ts DeviceConfig). */
+export interface DeviceConfig {
+  label: string;
+  serial: string;
+  appUnderTest: 'kubo' | 'veil' | 'custom';
+  customPackage?: string;
+  customBuildCmd?: string;
+  projectDir?: string;
+}
+
+export interface SetDeviceConfigMessage {
+  type: 'set-device-config';
+  config: DeviceConfig;
+}
+
+export interface DeviceConfigAckMessage {
+  type: 'device-config-ack';
+  success: boolean;
+  reachable?: boolean;
+  error?: string;
+}
+
 export interface CredentialsAckMessage {
   type: 'credentials-ack';
   machine: string;
@@ -340,7 +367,7 @@ export interface PairAckMessage {
 // --- Union ---
 
 export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | UsageMessage | CredentialsAckMessage | PairAckMessage;
-export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | UsageRequestMessage | SetCredentialsMessage | PairRequestMessage;
+export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | UsageRequestMessage | SetCredentialsMessage | SetDeviceConfigMessage | PairRequestMessage;
 export type BridgeMessage = BridgeOutbound | BridgeInbound;
 
 /**
