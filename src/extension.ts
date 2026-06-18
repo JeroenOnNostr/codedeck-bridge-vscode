@@ -23,6 +23,8 @@ import {
   saveSecretKey,
 } from './pairing';
 import type { PairedPhone, PairRequestMessage } from './types';
+import * as meshAdmin from './meshAdmin';
+import { registerPhoneOnRelay } from './relayAdmin';
 
 /** How long an open pairing window accepts auto pair-requests. */
 const PAIRING_WINDOW_MS = 180_000;
@@ -52,6 +54,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration('codedeck');
   const relays = config.get<string[]>('relays', ['wss://relay.primal.net', 'wss://relay.nostr.band', 'wss://nos.lol']);
   const machineName = config.get<string>('machineName', '') || os.hostname();
+  // Optional: auto-register a paired phone on a write-restricted private relay (see relayAdmin.ts).
+  const relayRegisterEndpoint = config.get<string>('relayRegisterEndpoint', '').trim();
+  const relayRegisterToken = config.get<string>('relayRegisterToken', '').trim();
 
   // --- Load paired phones ---
   const pairedPhones = loadPairedPhones(context);
@@ -69,7 +74,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const workspaceCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const lastSeenTimestamp = context.globalState.get<number>('codedeck_lastSeenTimestamp', 0);
   bridgeCore = new BridgeCore(
-    { secretKey, relays, machineName, pairedPhones, workspaceCwd, lastSeenTimestamp },
+    {
+      secretKey,
+      relays,
+      machineName,
+      pairedPhones,
+      workspaceCwd,
+      lastSeenTimestamp,
+      onMeshNotice: (level, message) => {
+        if (level === 'warn') {
+          vscode.window.showWarningMessage(`Codedeck: ${message}`);
+        } else {
+          vscode.window.showInformationMessage(`Codedeck: ${message}`);
+        }
+      },
+    },
     log,
   );
 
@@ -104,6 +123,19 @@ export function activate(context: vscode.ExtensionContext): void {
   // --- Helper: add a phone to the paired list (shared by manual + auto pairing) ---
   // Returns true if newly added, false if it was already paired or failed.
   const addPairedPhone = async (pubkeyHex: string, label: string): Promise<boolean> => {
+    // Auto-register the phone on the private relay (if configured) so it can publish high-frequency
+    // session traffic there. Done on EVERY pair (incl. re-pairs) so a re-scan repairs a missing
+    // registration; the relay endpoint is idempotent. Runs before the dedupe early-return below.
+    if (relayRegisterEndpoint && relayRegisterToken) {
+      const r = await registerPhoneOnRelay(pubkeyHex, { endpoint: relayRegisterEndpoint, token: relayRegisterToken });
+      if (r.ok) {
+        log(`[Codedeck] Phone registered on private relay (${r.status}): ${pubkeyHex.slice(0, 12)}…`);
+      } else if (r.reason !== 'not-configured') {
+        log(`[Codedeck] Phone relay-registration failed: ${r.reason}`);
+        vscode.window.showWarningMessage(`Codedeck: couldn't register the phone on the private relay (${r.reason}). It paired over the open relay, but session traffic on the private relay may be rejected.`);
+      }
+    }
+
     const phones = loadPairedPhones(context);
     if (phones.some(p => p.pubkeyHex === pubkeyHex)) {
       return false; // already paired (idempotent)
@@ -141,12 +173,19 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   // --- Helper: open pairing panel ---
-  const openPairingPanel = () => {
+  const openPairingPanel = async () => {
     if (!bridgeCore) { return; }
 
     // One-time token embedded in this session's QR; the phone echoes it back in
     // its pair-request and the bridge accepts only a matching token.
     const token = crypto.randomBytes(16).toString('hex');
+
+    // Fold a fresh mesh invite into the QR so the phone can self-join the mesh from the same scan.
+    // Best-effort: if nvpn/mesh isn't set up, this returns null and the pure-pairing QR still works.
+    const meshInvite = await meshAdmin.createInvite();
+    if (meshInvite) {
+      console.log('[Codedeck] Pairing QR includes mesh invite for network', meshInvite.networkId);
+    }
 
     const panel = showPairingPanel(
       context,
@@ -155,6 +194,8 @@ export function activate(context: vscode.ExtensionContext): void {
         relays,
         machine: machineName,
         token,
+        mesh: meshInvite?.invite,
+        netid: meshInvite?.networkId,
       },
       // Manual fallback: user pastes the phone's npub into the webview form.
       async (pubkeyInput: string, label: string) => {
@@ -246,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!pick) return;
 
       if (pick.label.includes('Pair new phone')) {
-        openPairingPanel();
+        await openPairingPanel();
       } else if (pick.label.includes('Show logs')) {
         out.show(true);
       } else if (pick.label.includes('Disconnect all')) {
@@ -261,7 +302,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('codedeck.pair', () => {
-      openPairingPanel();
+      void openPairingPanel();
     }),
   );
 

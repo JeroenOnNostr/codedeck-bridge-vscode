@@ -53,6 +53,16 @@
           "type": "string",
           "default": "",
           "description": "Display name for this machine (defaults to hostname)"
+        },
+        "codedeck.relayRegisterEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Optional admin endpoint to auto-register a paired phone's pubkey on a write-restricted private relay (e.g. https://relay2.descendant.io/api/register-agent). Leave empty if all your relays accept open writes. Pair the phone over an open relay in 'codedeck.relays'; once registered here it can also use the private relay for high-frequency session traffic."
+        },
+        "codedeck.relayRegisterToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer admin token for codedeck.relayRegisterEndpoint. Stored in VSCode settings — use a per-relay admin token, not a personal secret."
         }
       }
     }

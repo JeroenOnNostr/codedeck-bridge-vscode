@@ -30,9 +30,18 @@ export function showPairingPanel(
 
   const relaysParam = pairingInfo.relays.map(r => encodeURIComponent(r)).join(',');
   const tokenParam = pairingInfo.token ? `&token=${encodeURIComponent(pairingInfo.token)}` : '';
-  const pairingUrl = `codedeck://pair?npub=${pairingInfo.npub}&relays=${relaysParam}&machine=${encodeURIComponent(pairingInfo.machine)}${tokenParam}`;
+  // Mesh params let the phone self-join the mesh from the same scan. `mesh` carries the invite
+  // (which contains an inviteSecret), so it goes into the QR but NOT the human-readable URL box.
+  const meshParam = pairingInfo.mesh && pairingInfo.netid
+    ? `&netid=${encodeURIComponent(pairingInfo.netid)}&mesh=${encodeURIComponent(pairingInfo.mesh)}`
+    : '';
+  const base = `codedeck://pair?npub=${pairingInfo.npub}&relays=${relaysParam}&machine=${encodeURIComponent(pairingInfo.machine)}${tokenParam}`;
+  const pairingUrl = `${base}${meshParam}`;
+  // Shown to the user: never expose the invite secret on screen (it could be shoulder-surfed). The
+  // QR still carries the full URL; the visible box only hints that mesh is bundled.
+  const displayUrl = meshParam ? `${base}&mesh=…` : base;
 
-  panel.webview.html = getPairingHtml(pairingUrl, pairingInfo);
+  panel.webview.html = getPairingHtml(pairingUrl, displayUrl, pairingInfo);
 
   // Handle manual pairing (user pastes npub)
   panel.webview.onDidReceiveMessage(
@@ -65,7 +74,7 @@ function generateQrSvg(content: string): string {
   return qr.svg();
 }
 
-function getPairingHtml(pairingUrl: string, info: PairingInfo): string {
+function getPairingHtml(pairingUrl: string, displayUrl: string, info: PairingInfo): string {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -152,14 +161,16 @@ function getPairingHtml(pairingUrl: string, info: PairingInfo): string {
   </div>
 
   <div id="pairContent">
-    <p class="info">Scan this with your phone's camera, or copy the pairing URL below.</p>
+    <p class="info">Scan this with your phone's camera. The phone pairs automatically${info.mesh ? ', joins the mesh, and asks whether it\'s your controller or a test device' : ''}.</p>
 
     <div class="qr-container">
       ${generateQrSvg(pairingUrl)}
     </div>
 
+    ${info.mesh ? '<p class="info">📡 This QR also bundles a mesh invite, so the phone can self-join your private mesh in one scan.</p>' : ''}
+
     <p><strong>Pairing URL:</strong></p>
-    <div class="url-box">${escapeHtml(pairingUrl)}</div>
+    <div class="url-box">${escapeHtml(displayUrl)}</div>
 
     <p><strong>Bridge npub:</strong></p>
     <div class="url-box npub">${escapeHtml(info.npub)}</div>

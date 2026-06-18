@@ -16,6 +16,7 @@ import * as crypto from 'crypto';
 import { NostrRelay, NostrRelayEvents } from './nostrRelay';
 import { SdkSessionManager } from './sdkSession';
 import { buildScreenshotEntry } from './screenshotDelivery';
+import * as meshAdmin from './meshAdmin';
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, PairedPhone, UploadImageBlossomMessage, UploadImageChunkMessage } from './types';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
@@ -26,6 +27,9 @@ export interface BridgeCoreConfig {
   pairedPhones: PairedPhone[];
   workspaceCwd?: string;
   lastSeenTimestamp?: number;
+  /** Optional user-facing notice hook (wired to a VSCode toast in extension.ts). Used to surface
+   *  mesh-onboarding outcomes (e.g. "test device authorized" / "start the nvpn service"). */
+  onMeshNotice?: (level: 'info' | 'warn', message: string) => void;
 }
 
 /**
@@ -50,10 +54,12 @@ export class BridgeCore {
   private workspaceCwd: string;
   private imageChunks: Map<string, ImageUploadTracker> = new Map();
   private log: (msg: string) => void;
+  private onMeshNotice?: (level: 'info' | 'warn', message: string) => void;
 
   constructor(config: BridgeCoreConfig, log: (msg: string) => void = console.log) {
     this.workspaceCwd = config.workspaceCwd ?? '';
     this.log = log;
+    this.onMeshNotice = config.onMeshNotice;
 
     // --- SDK Session Manager ---
     this.sdk = new SdkSessionManager({
@@ -342,17 +348,10 @@ export class BridgeCore {
           this.handleImageChunk(chunk.sessionId, chunk.uploadId, chunk.filename, chunk.mimeType, chunk.base64Data, chunk.text, chunk.chunkIndex, chunk.totalChunks);
         }
       },
-      onSetDeviceConfig: (deviceConfig, _phonePubkey) => {
-        // Persist to .codedeck/device-config.json in the workspace, so both the bridge and the
-        // autonomous test-session (running Claude Code in the workspace) can read it.
-        try {
-          const dir = path.join(this.workspaceCwd || '.', '.codedeck');
-          fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(path.join(dir, 'device-config.json'), JSON.stringify(deviceConfig, null, 2));
-          log(`[Codedeck] Device config saved: ${deviceConfig.label} (${deviceConfig.serial}, app=${deviceConfig.appUnderTest})`);
-        } catch (err) {
-          log(`[Codedeck] Failed to save device config: ${err}`);
-        }
+      onSetDeviceConfig: (deviceConfig, phonePubkey) => {
+        this.handleSetDeviceConfig(deviceConfig, phonePubkey).catch(err => {
+          log(`[Codedeck] set-device-config handler error: ${err}`);
+        });
       },
     };
 
@@ -381,6 +380,84 @@ export class BridgeCore {
   dispose(): void {
     this.sdk.dispose();
     this.relay.dispose();
+  }
+
+  // --- Test-device config + mesh onboarding ---
+
+  /**
+   * Handle a `set-device-config` from the phone. For a 'test-target' phone this is also where the
+   * bridge does the formerly-manual mesh onboarding, with ZERO operator/CLI involvement.
+   *
+   * IMPORTANT: the phone's mesh VpnService runs its OWN nostr key, separate from the bridge-pairing
+   * key — so the bridge canNOT derive the phone's mesh IP from the pairing pubkey. The phone reports
+   * its real mesh identity (`meshIp` + `meshPubkey`, read from the engine's own state). The bridge:
+   *   1. Authorizes the reported MESH pubkey on the roster (`nvpn add-participant`) — idempotent.
+   *   2. Sets the adb serial to `<meshIp>:0` (port 0 → deviceActions.ensureConnected/discoverAdbPort
+   *      sweeps for the rotating Wireless-Debugging port at connect time). No mesh IP:port typed.
+   *   3. Warns if the local nvpn daemon is down (roster change won't propagate).
+   * Then persist to .codedeck/device-config.json so the autonomous test-session can read it.
+   */
+  private async handleSetDeviceConfig(
+    deviceConfig: import('./types').DeviceConfig,
+    phonePubkey: string,
+  ): Promise<void> {
+    const config = { ...deviceConfig };
+
+    if (config.role === 'test-target') {
+      const label = config.label || 'phone';
+      // The identity to authorize on the mesh is the phone's MESH pubkey (reported), NOT the
+      // bridge-pairing pubkey. Fall back to the pairing pubkey only if the phone didn't report one
+      // (older app) — though that will only be correct if the two keys happen to coincide.
+      const meshPubkey = config.meshPubkey || phonePubkey;
+      if (!config.meshPubkey) {
+        this.log('[Codedeck] Phone did not report a mesh pubkey — falling back to the pairing pubkey (may be wrong)');
+      }
+
+      // 1. Authorize on the mesh roster (best-effort; idempotent).
+      const authorized = await meshAdmin.addParticipant(meshPubkey);
+      if (authorized) {
+        this.log(`[Codedeck] Authorized test device on mesh roster: ${meshPubkey.slice(0, 12)}…`);
+        if (await meshAdmin.daemonRunning()) {
+          this.onMeshNotice?.('info', `Test device "${label}" authorized on the mesh.`);
+        } else {
+          this.onMeshNotice?.(
+            'warn',
+            `Mesh roster updated for "${label}", but the nvpn service isn't running — start it on this laptop to finish authorizing the device.`,
+          );
+        }
+      } else {
+        this.log('[Codedeck] add-participant failed or nvpn unavailable — test device not authorized on mesh');
+        this.onMeshNotice?.('warn', `Couldn't authorize "${label}" on the mesh (is nvpn installed and a network active?).`);
+      }
+
+      // 2. Build the adb serial from the phone's REAL reported mesh IP (authoritative).
+      if (!config.serial && config.meshIp && /^10\.44\.\d{1,3}\.\d{1,3}$/.test(config.meshIp)) {
+        config.serial = `${config.meshIp}:0`; // port 0 → discoverAdbPort sweeps for the live WD port
+        this.log(`[Codedeck] Test-device mesh serial (phone-reported): ${config.serial}`);
+      } else if (!config.serial) {
+        // Legacy fallback: derive from the pairing pubkey (only correct if mesh key == pairing key).
+        const ip = await meshAdmin.derivePeerIp(meshPubkey);
+        if (ip) {
+          config.serial = `${ip}:0`;
+          this.log(`[Codedeck] Test-device mesh serial (derived fallback): ${config.serial}`);
+        } else {
+          this.log('[Codedeck] No mesh IP reported and could not derive one — serial left unset');
+        }
+      }
+    }
+
+    // Strip transport-only fields before persisting — device-config.json is consumed by the
+    // test-session and only needs label/serial/app; meshIp/meshPubkey were inputs, not config.
+    const { meshIp: _mi, meshPubkey: _mp, ...persisted } = config;
+
+    try {
+      const dir = path.join(this.workspaceCwd || '.', '.codedeck');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'device-config.json'), JSON.stringify(persisted, null, 2));
+      this.log(`[Codedeck] Device config saved: ${persisted.label} (${persisted.serial ?? 'no serial'}, app=${persisted.appUnderTest}, role=${persisted.role ?? 'controller'})`);
+    } catch (err) {
+      this.log(`[Codedeck] Failed to save device config: ${err}`);
+    }
   }
 
   // --- Image upload: Blossom (encrypted blob) ---

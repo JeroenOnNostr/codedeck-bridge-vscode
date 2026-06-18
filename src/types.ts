@@ -314,7 +314,17 @@ export interface SetCredentialsMessage {
 /** Test-device config sent from the phone (mirrors codedeck/src/types.ts DeviceConfig). */
 export interface DeviceConfig {
   label: string;
-  serial: string;
+  /** Device role. 'test-target' phones get auto-authorized on the mesh and their adb serial is
+   *  derived bridge-side from their pubkey. Absent/'controller' means a normal control phone. */
+  role?: 'controller' | 'test-target';
+  /** adb serial (mesh ip:port). Optional: a 'test-target' phone reports its real mesh IP via
+   *  `meshIp` and the bridge builds the serial as `<meshIp>:0` (port 0 → adb port discovery). */
+  serial?: string;
+  /** The phone's REAL mesh tunnel IP (the mesh engine has its own key, separate from the pairing
+   *  key, so the bridge canNOT derive this from the pairing pubkey — the phone reports it). */
+  meshIp?: string;
+  /** The phone's MESH-engine pubkey (hex) — the identity to authorize on the mesh roster. */
+  meshPubkey?: string;
   appUnderTest: 'kubo' | 'veil' | 'custom';
   customPackage?: string;
   customBuildCmd?: string;
@@ -397,6 +407,11 @@ export interface PairingInfo {
   machine: string;
   /** One-time pairing token embedded in the QR for the auto-pairing handshake. */
   token?: string;
+  /** Fresh `nvpn://invite/...` code folded into the QR so the phone can self-join the mesh.
+   *  Absent when nvpn/mesh isn't available — the pure-pairing QR still works. */
+  mesh?: string;
+  /** Active mesh network id (e.g. "a237c978"), paired with `mesh`. */
+  netid?: string;
 }
 
 export interface PairedPhone {
