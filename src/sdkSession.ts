@@ -185,9 +185,11 @@ interface ManagedSession {
   answeredQuestions: Set<string>;
   /** Pending AskUserQuestion calls awaiting user answers, keyed by toolUseId. */
   pendingQuestions: Map<string, {
+    /** The full original tool input, echoed back (plus answers) in updatedInput. */
+    input: Record<string, unknown>;
     /** The questions array from the tool input. */
     questions: Array<{ question: string; header?: string }>;
-    /** Accumulated answers so far (header → selected answer). */
+    /** Accumulated answers so far (question text → selected answer). */
     answers: Record<string, string>;
     /** Number of answers still needed before resolving. */
     remaining: number;
@@ -385,9 +387,10 @@ export class SdkSessionManager {
       const pending = session.pendingQuestions.get(toolUseId);
       if (!pending) continue;
 
-      const header = (entry.metadata.header as string) || 'question';
+      const qIdx = (entry.metadata.question_index as number | undefined) ?? 0;
+      const questionText = pending.questions[qIdx]?.question ?? entry.content;
       session.lastActivity = new Date().toISOString();
-      this.resolveQuestionAnswer(session, toolUseId, header, text);
+      this.resolveQuestionAnswer(session, toolUseId, questionText, text);
       return true;
     }
 
@@ -658,13 +661,17 @@ export class SdkSessionManager {
   private resolveQuestionAnswer(
     session: ManagedSession,
     toolUseId: string,
-    header: string,
+    questionText: string,
     answer: string,
   ): void {
     const pending = session.pendingQuestions.get(toolUseId);
     if (!pending) return;
 
-    pending.answers[header] = answer;
+    // SDK 0.3.x AskUserQuestion keys answers by the full question text (see
+    // AskUserQuestionOutput.answers: "question text -> answer string"), NOT the
+    // short header. Keying by header leaves the per-question lookup undefined and
+    // crashes the SDK's result builder ("undefined is not an object ... map").
+    pending.answers[questionText] = answer;
     pending.remaining--;
 
     if (pending.remaining <= 0) {
@@ -678,9 +685,11 @@ export class SdkSessionManager {
         if (first !== undefined) session.answeredQuestions.delete(first);
       }
 
+      // Echo the original input (questions/options/multiSelect) and add the
+      // collected answers. The SDK fills AskUserQuestionInput.answers from here.
       pending.resolve({
         behavior: 'allow',
-        updatedInput: { answers: pending.answers },
+        updatedInput: { ...pending.input, answers: pending.answers },
       });
     }
   }
@@ -713,9 +722,10 @@ export class SdkSessionManager {
       if (!options || keyNum > options.length) continue;
 
       const selected = options[keyNum - 1];
-      const header = (entry.metadata.header as string) || 'question';
+      const qIdx = (entry.metadata.question_index as number | undefined) ?? 0;
+      const questionText = pending.questions[qIdx]?.question ?? entry.content;
       session.lastActivity = new Date().toISOString();
-      this.resolveQuestionAnswer(session, toolUseId, header, selected.label);
+      this.resolveQuestionAnswer(session, toolUseId, questionText, selected.label);
       return true;
     }
 
@@ -947,6 +957,7 @@ export class SdkSessionManager {
         };
 
         session.pendingQuestions.set(options.toolUseID, {
+          input: toolInput,
           questions: rawQuestions,
           answers: {},
           remaining: rawQuestions.length,

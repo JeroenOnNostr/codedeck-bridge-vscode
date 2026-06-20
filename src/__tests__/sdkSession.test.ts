@@ -64,9 +64,11 @@ function injectQuestionHistory(
       },
     } as OutputEntry,
   });
-  // Also inject the pending question promise (mirrors handlePermission behavior)
+  // Also inject the pending question promise (mirrors handlePermission behavior).
+  // `input` is the full original tool input, echoed back in updatedInput.
   return new Promise<PermissionResult>((resolve) => {
     session.pendingQuestions.set(toolUseId, {
+      input: { questions: [{ question: 'What should I do?', header, options, multiSelect: false }] },
       questions: [{ question: 'What should I do?', header }],
       answers: {},
       remaining: 1,
@@ -115,7 +117,9 @@ describe('SdkSessionManager', () => {
       const result = await resultPromise;
       expect(result.behavior).toBe('allow');
       if (result.behavior === 'allow') {
-        expect(result.updatedInput).toEqual({ answers: { Approach: 'Option B' } });
+        // SDK 0.3.x: answers keyed by question text (not header), questions echoed back
+        expect(result.updatedInput!.answers).toEqual({ 'What should I do?': 'Option B' });
+        expect(result.updatedInput!.questions).toBeDefined();
       }
 
       const sessions = (sdk as any).sessions as Map<string, any>;
@@ -158,7 +162,8 @@ describe('SdkSessionManager', () => {
       const result = await resultPromise;
       expect(result.behavior).toBe('allow');
       if (result.behavior === 'allow') {
-        expect(result.updatedInput).toEqual({ answers: { Method: 'New A' } });
+        expect(result.updatedInput!.answers).toEqual({ 'What should I do?': 'New A' });
+        expect(result.updatedInput!.questions).toBeDefined();
       }
     });
 
@@ -180,7 +185,8 @@ describe('SdkSessionManager', () => {
       const result = await resultPromise;
       expect(result.behavior).toBe('allow');
       if (result.behavior === 'allow') {
-        expect(result.updatedInput).toEqual({ answers: { Library: 'Use axios instead' } });
+        expect(result.updatedInput!.answers).toEqual({ 'What should I do?': 'Use axios instead' });
+        expect(result.updatedInput!.questions).toBeDefined();
       }
     });
 
@@ -189,6 +195,34 @@ describe('SdkSessionManager', () => {
       // sendInput returns true if session exists
       expect(sent).toBe(true);
       expect(events.logs.some(l => l.includes('falling back to sendInput'))).toBe(true);
+    });
+  });
+
+  // Regression guard for CDB-022: SDK 0.3.177 changed the AskUserQuestion answer
+  // contract. The host must return updatedInput = original input (with `questions`)
+  // PLUS `answers` keyed by the full question text. The old shape
+  // (`{ answers: { [header]: label } }`, no questions) crashed the SDK's Bun/JSC
+  // result builder with "undefined is not an object (evaluating 'H.map')".
+  describe('AskUserQuestion answer contract (SDK 0.3.177)', () => {
+    it('echoes the original questions array and keys answers by question text', async () => {
+      const resultPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_contract', [
+        { label: 'Yes', description: 'do it' },
+        { label: 'No', description: 'skip it' },
+      ], 'Confirm');
+
+      expect(sdk.resolveQuestionKeypress(SESSION_ID, '1')).toBe(true);
+
+      const result = await resultPromise;
+      expect(result.behavior).toBe('allow');
+      if (result.behavior === 'allow') {
+        const updated = result.updatedInput as { questions?: unknown[]; answers?: Record<string, string> };
+        // `questions` must survive — the SDK maps over it to build the output
+        expect(Array.isArray(updated.questions)).toBe(true);
+        expect(updated.questions!.length).toBe(1);
+        // answers keyed by the full question text, NOT the short header
+        expect(updated.answers).toEqual({ 'What should I do?': 'Yes' });
+        expect(updated.answers).not.toHaveProperty('Confirm');
+      }
     });
   });
 
