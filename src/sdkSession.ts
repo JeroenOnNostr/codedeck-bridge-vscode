@@ -12,6 +12,8 @@
 import { query, getSessionMessages } from '@anthropic-ai/claude-agent-sdk';
 import * as os from 'os';
 import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { createDeviceMcpServer } from './deviceActions';
 import type {
   Query,
@@ -28,6 +30,25 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, UsageData, UsageWindow } from './types';
 import { sdkMessageToEntries } from './sdkAdapter';
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Read the current git HEAD commit hash for a working directory.
+ * Returns null if the dir is not a git repo or git is unavailable.
+ */
+async function gitHeadHash(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+      cwd,
+      timeout: 5000,
+      windowsHide: true,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Fallback model used by every session's query() Options. If the primary model is
@@ -204,8 +225,10 @@ interface ManagedSession {
   summarized: boolean;
   /** Project name extracted from session-meta tag (overrides cwd-derived name). */
   projectOverride?: string;
-  /** Whether a git commit command has been detected in this session. */
+  /** Whether a commit has been detected in this session — by the agent or made manually. */
   committed: boolean;
+  /** git HEAD hash captured at session start; `committed` flips once HEAD advances past it. */
+  baseHead?: string;
   /** Current session state: idle (waiting for user input) or running (Claude is working). */
   sessionState: 'idle' | 'running';
   /** Whether the session is still running. */
@@ -217,9 +240,12 @@ interface ManagedSession {
 export class SdkSessionManager {
   private static readonly MAX_RESTARTS = 2;
   private static readonly PERMISSION_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+  private static readonly GIT_POLL_MS = 10_000; // How often to reconcile `committed` with git HEAD.
 
   private sessions = new Map<string, ManagedSession>();
   private events: SdkSessionEvents;
+  /** Interval that reconciles each session's `committed` flag with real git state. */
+  private gitPollTimer?: ReturnType<typeof setInterval>;
 
   /**
    * Optional hook: deliver a captured device screenshot to the phone (Phase 3 wires this to the
@@ -230,6 +256,10 @@ export class SdkSessionManager {
 
   constructor(events: SdkSessionEvents) {
     this.events = events;
+    // Periodically reconcile each session's `committed` flag with real git state, so the
+    // badge appears whether the commit was made by the agent or manually in a terminal.
+    this.gitPollTimer = setInterval(() => { void this.pollGitCommits(); }, SdkSessionManager.GIT_POLL_MS);
+    this.gitPollTimer.unref?.();
   }
 
   /**
@@ -276,6 +306,9 @@ export class SdkSessionManager {
       alive: true,
       restartCount: 0,
     };
+
+    // Capture the starting git HEAD so commits made any way (agent Bash or manual terminal) are detected.
+    void gitHeadHash(cwd).then((head) => { if (head) session.baseHead = head; });
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       return this.handlePermission(sessionId, session, toolName, toolInput, options);
@@ -735,12 +768,36 @@ export class SdkSessionManager {
 
   /** Dispose all sessions. */
   dispose(): void {
+    if (this.gitPollTimer) { clearInterval(this.gitPollTimer); this.gitPollTimer = undefined; }
     for (const [id] of this.sessions) {
       this.closeSession(id);
     }
   }
 
   // --- Internal ---
+
+  /**
+   * Reconcile one session's `committed` flag with git: flip it to true once HEAD has
+   * advanced past the hash captured at session start. Returns true if it changed.
+   */
+  private async detectCommit(session: ManagedSession): Promise<boolean> {
+    if (!session.alive || session.committed || !session.baseHead) return false;
+    const head = await gitHeadHash(session.cwd);
+    if (head && head !== session.baseHead) {
+      session.committed = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** Poll every uncommitted session for new commits (agent- or user-made) and notify the phone. */
+  private async pollGitCommits(): Promise<void> {
+    let changed = false;
+    for (const [, session] of this.sessions) {
+      if (await this.detectCommit(session)) changed = true;
+    }
+    if (changed) this.events.onSessionListChanged(this.getSessions());
+  }
 
   /** Consume SDK messages and forward as OutputEntry to the Nostr relay. */
   private async consumeMessages(sessionId: string, session: ManagedSession, q: Query): Promise<void> {
@@ -803,16 +860,20 @@ export class SdkSessionManager {
           }
         }
 
-        // Detect git commit commands
+        // Fast path: the agent may have just run `git commit`. Verify against git HEAD right away so
+        // the badge updates without waiting for the next poll. (Manual commits are caught by the poll.)
         if (!session.committed) {
           for (const entry of entries) {
             if (entry.entryType === 'tool_use'
                 && entry.metadata?.tool_name === 'Bash'
                 && /\bgit\s+commit\b(?!\s+--help)/.test(
                      String((entry.metadata?.tool_input as Record<string, unknown>)?.command ?? ''))) {
-              session.committed = true;
-              this.events.log(`[SDK] Git commit detected in session ${sessionId}`);
-              this.events.onSessionListChanged(this.getSessions());
+              void this.detectCommit(session).then((changed) => {
+                if (changed) {
+                  this.events.log(`[SDK] Git commit detected in session ${sessionId}`);
+                  this.events.onSessionListChanged(this.getSessions());
+                }
+              });
               break;
             }
           }
