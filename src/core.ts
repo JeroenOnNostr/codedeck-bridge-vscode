@@ -80,6 +80,9 @@ export class BridgeCore {
             tool_use_id: request.toolUseId,
             tool_input: request.toolInput,
             description: request.description,
+            subagent: request.isSubAgent || undefined,
+            agent_id: request.agentId,
+            agent_label: request.agentLabel,
           },
         };
         this.relay.publishOutput(request.sessionId, [{ seq: 0, entry }]).catch(err => {

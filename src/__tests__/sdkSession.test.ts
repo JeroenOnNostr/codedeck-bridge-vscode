@@ -196,6 +196,48 @@ describe('SdkSessionManager', () => {
       expect(sent).toBe(true);
       expect(events.logs.some(l => l.includes('falling back to sendInput'))).toBe(true);
     });
+
+    // Regression: a multi-question group must collect answers q0,q1,... IN ORDER. The old
+    // backward-scan keyed off the entry's own question_index (always the LAST question), so a
+    // 2-question group overwrote q1 twice and dropped q0. Now it keys off `remaining`.
+    it('resolves a 2-question group in order (q0 then q1), not overwriting the last', async () => {
+      const sessions = (sdk as any).sessions as Map<string, any>;
+      const session = sessions.get(SESSION_ID);
+      const q0 = { question: 'First question?', header: 'Q0', options: [{ label: 'a0' }] };
+      const q1 = { question: 'Second question?', header: 'Q1', options: [{ label: 'b1' }] };
+      // Two ask_question history entries sharing one tool_use_id, indices 0 and 1.
+      for (const [idx, q] of [q0, q1].entries()) {
+        session.history.push({
+          seq: ++session.seqCounter,
+          entry: {
+            entryType: 'system', content: q.question, timestamp: new Date().toISOString(),
+            metadata: { special: 'ask_question', tool_use_id: 'grp', header: q.header, options: q.options, question_index: idx, question_count: 2 },
+          },
+        });
+      }
+      const resultPromise = new Promise<PermissionResult>((resolve) => {
+        session.pendingQuestions.set('grp', {
+          input: { questions: [q0, q1] },
+          questions: [q0, q1],
+          answers: {},
+          remaining: 2,
+          resolve,
+        });
+      });
+
+      // Answer in order; group resolves only after BOTH.
+      expect(sdk.sendQuestionInput(SESSION_ID, 'answer-zero')).toBe(true);
+      expect(sdk.sendQuestionInput(SESSION_ID, 'answer-one')).toBe(true);
+
+      const result = await resultPromise;
+      expect(result.behavior).toBe('allow');
+      if (result.behavior === 'allow') {
+        expect(result.updatedInput!.answers).toEqual({
+          'First question?': 'answer-zero',
+          'Second question?': 'answer-one',
+        });
+      }
+    });
   });
 
   // Regression guard for CDB-022: SDK 0.3.177 changed the AskUserQuestion answer
@@ -298,6 +340,47 @@ describe('SdkSessionManager', () => {
     it('returns not-applied for an unknown session', async () => {
       const { applied } = await sdk.setEffortLevel('nope', 'high');
       expect(applied).toBe(false);
+    });
+  });
+
+  // Regression guard for the AskUserQuestion wedge: an orphaned pending question (or permission)
+  // must be denied+cleared on interrupt/close/restart, or its canUseTool promise dangles forever
+  // and the SDK emits "Tool permission stream closed before response received".
+  describe('denyAllPending — drain on interrupt/close', () => {
+    it('interruptSession denies pending PERMISSIONS and QUESTIONS and clears both maps', async () => {
+      const permPromise = injectPendingPermission(sdk, SESSION_ID, 'tool_perm', 'Bash');
+      const qPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_q', [{ label: 'A' }], 'Q');
+
+      const ok = sdk.interruptSession(SESSION_ID);
+      expect(ok).toBe(true);
+
+      const perm = await permPromise;
+      const q = await qPromise;
+      expect(perm.behavior).toBe('deny');
+      expect(q.behavior).toBe('deny');
+
+      const session = (sdk as any).sessions.get(SESSION_ID);
+      expect(session.pendingPermissions.size).toBe(0);
+      expect(session.pendingQuestions.size).toBe(0);
+      // phone is told to clear its waiting state
+      expect(events.onSessionListChanged).toHaveBeenCalled();
+    });
+
+    it('closeSession denies a pending QUESTION (not just permissions)', async () => {
+      const qPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_q2', [{ label: 'A' }], 'Q');
+      const ok = sdk.closeSession(SESSION_ID);
+      expect(ok).toBe(true);
+      const q = await qPromise;
+      expect(q.behavior).toBe('deny');
+    });
+
+    it('a phone answer arriving AFTER the drain is a harmless no-op (no double-resolve)', async () => {
+      const qPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_q3', [{ label: 'A' }], 'Q');
+      sdk.interruptSession(SESSION_ID);
+      const first = await qPromise; // resolved by the drain
+      expect(first.behavior).toBe('deny');
+      // Late keypress finds no pending question → returns false, does NOT throw or re-resolve.
+      expect(sdk.resolveQuestionKeypress(SESSION_ID, '1')).toBe(false);
     });
   });
 

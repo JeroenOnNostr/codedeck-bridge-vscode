@@ -73,6 +73,64 @@ export function touchesSecretPath(toolName: string, toolInput: Record<string, un
   return SECRET_PATH_RE.test(haystack);
 }
 
+/** Absolute path of the harness plan-authoring directory (`~/.claude/plans`, honoring CLAUDE_CONFIG_DIR). */
+function plansDirPath(): string {
+  const env = process.env.CLAUDE_CONFIG_DIR;
+  const base = env && env.trim() ? env.trim() : path.join(os.homedir(), '.claude');
+  return path.join(base, 'plans');
+}
+
+/**
+ * Detect a benign write confined to the harness plan directory (`~/.claude/plans`).
+ *
+ * In plan mode the SDK gates writes through canUseTool. A plan sub-agent's `mkdir -p ~/.claude/plans`
+ * (or writing the plan file itself) would otherwise block on phone approval — and if that prompt is
+ * never surfaced/answered it deadlocks the whole session (the sub-agent never returns to the parent).
+ * Auto-allowing ONLY this narrow, safe path breaks that deadlock without weakening plan mode for real
+ * edits. Fails CLOSED: anything ambiguous returns false and falls through to normal phone approval.
+ */
+export function isBenignPlanDirWrite(toolName: string, toolInput: Record<string, unknown>): boolean {
+  const plansDir = plansDirPath();
+  // Expand ONLY a bare `~` / `~/...` (current user's home). `~otheruser` is deliberately left
+  // unexpanded so it cannot resolve into our plans dir — it falls through to phone approval.
+  const expandTilde = (p: string): string =>
+    p === '~' ? os.homedir()
+    : p.startsWith('~/') ? path.join(os.homedir(), p.slice(2))
+    : p;
+  const underPlans = (p: unknown): boolean => {
+    if (typeof p !== 'string' || !p) return false;
+    const resolved = path.resolve(expandTilde(p));
+    return resolved === plansDir || resolved.startsWith(plansDir + path.sep);
+  };
+
+  switch (toolName) {
+    case 'Write':
+    case 'Edit':
+    case 'MultiEdit':
+      return underPlans(toolInput.file_path);
+    case 'NotebookEdit':
+      return underPlans(toolInput.notebook_path ?? toolInput.file_path);
+    case 'Bash': {
+      let command = typeof toolInput.command === 'string' ? toolInput.command.trim() : '';
+      if (!command) return false;
+      // Strip harmless trailing `echo "<literal>"` status messages the harness appends. Only
+      // string-literal echoes (no $, backtick, backslash, or redirection) are removed.
+      command = command.replace(/(^|;)\s*echo\s+(?:"[^"$`\\]*"|'[^']*')\s*(?=;|$)/g, '$1');
+      command = command.replace(/^\s*;+|;+\s*$/g, '').trim();
+      // Strip a harmless stderr-suppression redirect on the mkdir.
+      command = command.replace(/\s+2>\s*\/dev\/null\b/g, '').trim();
+      // Whatever remains must be a single simple mkdir with no chaining/redirection metacharacters.
+      // `~` is allowed through (expandTilde handles it below); `..` is still rejected.
+      if (/[;&|`$<>]|\.\./.test(command)) return false;
+      const m = command.match(/^mkdir\s+(?:-p\s+)?(['"]?)([^'"]+)\1$/);
+      if (!m) return false;
+      return underPlans(m[2]);
+    }
+    default:
+      return false;
+  }
+}
+
 /**
  * Map a phone effort level to the SDK's Options.effort value (used at query() construction).
  * Unlike the mid-session applyFlagSettings path, Options.effort accepts the full set incl. 'max',
@@ -160,6 +218,12 @@ export interface PermissionRequest {
   toolInput: Record<string, unknown>;
   title?: string;
   description?: string;
+  /** Opaque sub-agent ID if this tool call originates inside a sub-agent (from canUseTool options). */
+  agentId?: string;
+  /** True when the request came from a sub-agent rather than the top-level turn. */
+  isSubAgent?: boolean;
+  /** Best-effort friendly sub-agent type (e.g. 'Plan'), tracked from the most recent Task/Agent call. */
+  agentLabel?: string;
   resolve: (result: PermissionResult) => void;
 }
 
@@ -235,6 +299,8 @@ interface ManagedSession {
   alive: boolean;
   /** Number of times this session has been auto-restarted after crash. */
   restartCount: number;
+  /** Most recent Task/Agent subagent_type — best-effort label for a sub-agent's permission card. */
+  lastSubagentType?: string;
 }
 
 export class SdkSessionManager {
@@ -389,13 +455,33 @@ export class SdkSessionManager {
       this.events.log(`[SDK] Interrupt failed for ${sessionId}: ${err}`);
     });
 
-    // Deny all pending permissions so the SDK isn't blocked
-    for (const [toolUseId, pending] of session.pendingPermissions) {
-      pending.resolve({ behavior: 'deny', message: 'Interrupted by user' });
-    }
-    session.pendingPermissions.clear();
+    // Deny all pending permissions AND questions so the SDK isn't blocked.
+    this.denyAllPending(session, 'Interrupted by user');
+    // Re-publish so the phone clears any "waiting_permission"/"waiting_question" state.
+    this.events.onSessionListChanged(this.getSessions());
 
     return true;
+  }
+
+  /**
+   * Resolve+clear every pending permission and AskUserQuestion promise for a session with a deny.
+   * Each promise's resolve is the `wrappedResolve` that clears its 24h timeout, so this cannot
+   * double-resolve later (a subsequent phone answer finds the map entry gone and no-ops).
+   *
+   * Why questions too: an orphaned pending question is exactly what strands a turn after an
+   * auto-restart — the old query is abandoned but its canUseTool promise lives on in the map, and
+   * the SDK emits "Tool permission stream closed before response received". Draining here lets the
+   * phone clear its waiting state and the user retry. Callers publish onSessionListChanged.
+   */
+  private denyAllPending(session: ManagedSession, message: string): void {
+    for (const [, pending] of session.pendingPermissions) {
+      pending.resolve({ behavior: 'deny', message });
+    }
+    session.pendingPermissions.clear();
+    for (const [, pending] of session.pendingQuestions) {
+      pending.resolve({ behavior: 'deny', message });
+    }
+    session.pendingQuestions.clear();
   }
 
   /**
@@ -409,7 +495,29 @@ export class SdkSessionManager {
     const session = this.sessions.get(sessionId);
     if (!session || !session.alive) { return false; }
 
-    // Scan history backwards for the most recent unanswered ask_question
+    const target = this.nextUnansweredQuestion(session);
+    if (target) {
+      session.lastActivity = new Date().toISOString();
+      this.resolveQuestionAnswer(session, target.toolUseId, target.questionText, text);
+      return true;
+    }
+
+    // No pending question found — fall back to regular input
+    this.events.log(`[SDK] No pending question for question-input in ${sessionId} — falling back to sendInput`);
+    return this.sendInput(sessionId, text);
+  }
+
+  /**
+   * Resolve the next question that should receive an answer. Questions in a multi-question group
+   * are answered IN ORDER, so the target index within a group is `questions.length - remaining`
+   * (how many of that group's questions are already answered). We pick the most-recently-asked
+   * still-pending group by scanning history backwards (matches the phone's "active" card).
+   * Keying off `pending.remaining` — not the entry's own `question_index` — is what makes a
+   * 3-question group resolve q0,q1,q2 instead of overwriting the last question three times.
+   */
+  private nextUnansweredQuestion(
+    session: ManagedSession,
+  ): { toolUseId: string; questionText: string } | null {
     for (let i = session.history.length - 1; i >= 0; i--) {
       const entry = session.history[i].entry;
       if (entry.metadata?.special !== 'ask_question') continue;
@@ -420,16 +528,12 @@ export class SdkSessionManager {
       const pending = session.pendingQuestions.get(toolUseId);
       if (!pending) continue;
 
-      const qIdx = (entry.metadata.question_index as number | undefined) ?? 0;
-      const questionText = pending.questions[qIdx]?.question ?? entry.content;
-      session.lastActivity = new Date().toISOString();
-      this.resolveQuestionAnswer(session, toolUseId, questionText, text);
-      return true;
+      // First unanswered question in this group, in order.
+      const idx = Math.max(0, pending.questions.length - pending.remaining);
+      const questionText = pending.questions[idx]?.question ?? entry.content;
+      return { toolUseId, questionText };
     }
-
-    // No pending question found — fall back to regular input
-    this.events.log(`[SDK] No pending question for question-input in ${sessionId} — falling back to sendInput`);
-    return this.sendInput(sessionId, text);
+    return null;
   }
 
   /** Find a pending permission by tool name. Returns the toolUseId if found. */
@@ -454,6 +558,8 @@ export class SdkSessionManager {
     }
 
     session.pendingPermissions.delete(toolUseId);
+    // Permission answered — re-publish so the phone clears the "waiting_permission" state.
+    this.events.onSessionListChanged(this.getSessions());
 
     if (allow) {
       const result: PermissionResult = { behavior: 'allow', updatedInput: {} };
@@ -600,11 +706,8 @@ export class SdkSessionManager {
     session.input.close();
     session.abortController.abort();
 
-    // Reject any pending permissions
-    for (const [, pending] of session.pendingPermissions) {
-      pending.resolve({ behavior: 'deny', message: 'Session closed' });
-    }
-    session.pendingPermissions.clear();
+    // Reject any pending permissions AND questions so their canUseTool promises don't dangle.
+    this.denyAllPending(session, 'Session closed');
 
     this.sessions.delete(sessionId);
     this.events.log(`[SDK] Session ${sessionId} closed`);
@@ -724,6 +827,9 @@ export class SdkSessionManager {
         behavior: 'allow',
         updatedInput: { ...pending.input, answers: pending.answers },
       });
+
+      // Publish so the phone clears the "waiting_question" state now that the group is answered.
+      this.events.onSessionListChanged(this.getSessions());
     }
   }
 
@@ -751,12 +857,17 @@ export class SdkSessionManager {
       const pending = session.pendingQuestions.get(toolUseId);
       if (!pending) continue;
 
-      const options = entry.metadata.options as Array<{ label: string }> | undefined;
+      // Resolve the NEXT unanswered question in this group (in order), and use ITS options — not
+      // the scanned entry's, which in a multi-question group is always the last question. The phone
+      // sends keypresses per active question, so the option set must match that same question.
+      const qIdx = Math.max(0, pending.questions.length - pending.remaining);
+      const target = pending.questions[qIdx] as { question?: string; options?: Array<{ label: string }> } | undefined;
+      const options = (target?.options
+        ?? entry.metadata.options as Array<{ label: string }> | undefined);
       if (!options || keyNum > options.length) continue;
 
       const selected = options[keyNum - 1];
-      const qIdx = (entry.metadata.question_index as number | undefined) ?? 0;
-      const questionText = pending.questions[qIdx]?.question ?? entry.content;
+      const questionText = target?.question ?? entry.content;
       session.lastActivity = new Date().toISOString();
       this.resolveQuestionAnswer(session, toolUseId, questionText, selected.label);
       return true;
@@ -838,6 +949,17 @@ export class SdkSessionManager {
         const entries = sdkMessageToEntries(msg);
         if (entries.length === 0) continue;
 
+        // Track the most recent sub-agent type so a sub-agent's permission card can be labelled
+        // on the phone. Best-effort: canUseTool only exposes an opaque agentID, not the type, and
+        // this is wrong if several sub-agents run in parallel — acceptable for the common plan flow.
+        for (const entry of entries) {
+          if (entry.entryType === 'tool_use'
+              && (entry.metadata?.tool_name === 'Task' || entry.metadata?.tool_name === 'Agent')) {
+            const sub = (entry.metadata?.tool_input as Record<string, unknown> | undefined)?.subagent_type;
+            if (typeof sub === 'string' && sub) session.lastSubagentType = sub;
+          }
+        }
+
         // Parse session-meta tag from first assistant response
         if (!session.summarized) {
           for (const entry of entries) {
@@ -902,6 +1024,14 @@ export class SdkSessionManager {
       if (session.restartCount < SdkSessionManager.MAX_RESTARTS) {
         session.restartCount++;
         this.events.log(`[SDK] Restarting session ${sessionId} (attempt ${session.restartCount}/${SdkSessionManager.MAX_RESTARTS})`);
+
+        // The old query is dead. Any permission/question promise still tied to it would resolve
+        // into the void — the SDK then emits "Tool permission stream closed before response
+        // received" and the turn strands forever (this is exactly how a pending multi-select
+        // AskUserQuestion wedged a session). Drain them now and clear the phone's waiting state.
+        this.denyAllPending(session, 'Session restarted — please retry');
+        session.lastSubagentType = undefined; // fresh resumed query starts a fresh agent context
+        this.events.onSessionListChanged(this.getSessions());
 
         // Notify phone that we're restarting
         const restartEntry: OutputEntry = {
@@ -1010,6 +1140,8 @@ export class SdkSessionManager {
           session.pendingQuestions.delete(options.toolUseID);
           this.events.log(`[SDK] Question timed out (${options.toolUseID}) in ${sessionId}`);
           resolve({ behavior: 'deny', message: 'Question timed out' });
+          // Publish so the phone clears the "waiting_question" state on timeout.
+          this.events.onSessionListChanged(this.getSessions());
         }, SdkSessionManager.PERMISSION_TIMEOUT_MS);
 
         const wrappedResolve = (result: PermissionResult) => {
@@ -1024,6 +1156,12 @@ export class SdkSessionManager {
           remaining: rawQuestions.length,
           resolve: wrappedResolve,
         });
+
+        // Publish the session list so the phone immediately shows a visible "waiting_question"
+        // state (getSessions() derives it from pendingQuestions.size). Without this the phone never
+        // learns the turn is blocked on the user — exactly how an unanswered question deadlocks it.
+        this.events.log(`[SDK] WAITING ON PHONE ANSWER: AskUserQuestion (${options.toolUseID}) in ${sessionId}`);
+        this.events.onSessionListChanged(this.getSessions());
       });
     }
 
@@ -1045,12 +1183,26 @@ export class SdkSessionManager {
       return Promise.resolve({ behavior: 'allow', updatedInput: {} });
     }
 
-    // Plan / acceptEdits: forward to phone for manual approval
+    // Plan-authoring escape hatch: a plan-mode write confined to the harness plan directory
+    // (~/.claude/plans) — typically a sub-agent's `mkdir -p ~/.claude/plans` — would otherwise
+    // block on phone approval and can deadlock the whole session. Auto-allow ONLY this narrow,
+    // safe path; everything else still forwards to the phone. (Narrow + fail-closed.)
+    if (isBenignPlanDirWrite(toolName, toolInput)) {
+      this.events.log(`[SDK] Auto-allowed benign plans-dir write in ${sessionId}: ${toolName}`);
+      return Promise.resolve({ behavior: 'allow', updatedInput: {} });
+    }
+
+    // Plan / acceptEdits: forward to phone for manual approval. Capture sub-agent origin so the
+    // phone can label the card ("Sub-agent wants to run ...") — canUseTool exposes only an opaque
+    // agentID, not the agent type, so the friendly name is best-effort (session.lastSubagentType).
+    const agentId = (options as { agentID?: string }).agentID;
+    const isSubAgent = !!agentId;
     return new Promise<PermissionResult>((resolve) => {
       const timer = setTimeout(() => {
         session.pendingPermissions.delete(options.toolUseID);
         this.events.log(`[SDK] Permission timed out for ${toolName} (${options.toolUseID}) in session ${sessionId}`);
         resolve({ behavior: 'deny', message: 'Permission timed out' });
+        this.events.onSessionListChanged(this.getSessions());
       }, SdkSessionManager.PERMISSION_TIMEOUT_MS);
 
       const wrappedResolve = (result: PermissionResult) => {
@@ -1067,8 +1219,17 @@ export class SdkSessionManager {
         toolInput,
         title: options.title,
         description: options.description,
+        agentId,
+        isSubAgent,
+        agentLabel: isSubAgent ? session.lastSubagentType : undefined,
         resolve: wrappedResolve,
       });
+
+      // Publish the session list so the phone immediately shows a visible "waiting_permission"
+      // state (getSessions() derives it from pendingPermissions.size). Without this the phone never
+      // learns the turn is blocked on the user, which is exactly how a buried prompt deadlocks.
+      this.events.log(`[SDK] WAITING ON PHONE APPROVAL: ${toolName} (${options.toolUseID})${isSubAgent ? ` [subagent ${agentId}]` : ''} in ${sessionId}`);
+      this.events.onSessionListChanged(this.getSessions());
     });
   }
 }
