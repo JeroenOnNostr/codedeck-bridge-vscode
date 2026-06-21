@@ -751,6 +751,23 @@ export class SdkSessionManager {
   }
 
   /**
+   * Allocate the next monotonic output seq for a session (CDB-025).
+   *
+   * Out-of-band entries published by core.ts outside the normal onOutput stream — permission
+   * cards, auth errors, device screenshots — must each carry a UNIQUE per-session seq. The phone
+   * dedups output by seq (sessionStore: `if (seen.has(seq)) return`), so reusing a constant (the
+   * old hardcoded `seq: 0`) made the 2nd+ such entry get silently dropped — e.g. a session's second
+   * permission card never rendered, leaving the "waiting_permission" pill with nothing to tap and
+   * wedging the turn. Sharing the same counter as normal output also keeps these entries correctly
+   * ordered relative to the surrounding stream. Returns 0 only if the session is unknown.
+   */
+  nextSeq(sessionId: string): number {
+    const session = this.sessions.get(sessionId);
+    if (!session) { return 0; }
+    return ++session.seqCounter;
+  }
+
+  /**
    * Get history from SDK's persistent JSONL storage.
    * Falls back to this when in-memory history is empty (e.g. after extension reload).
    */
@@ -1212,18 +1229,23 @@ export class SdkSessionManager {
 
       session.pendingPermissions.set(options.toolUseID, { toolName, resolve: wrappedResolve });
 
-      this.events.onPermissionRequest({
-        sessionId,
-        toolName,
-        toolUseId: options.toolUseID,
-        toolInput,
-        title: options.title,
-        description: options.description,
-        agentId,
-        isSubAgent,
-        agentLabel: isSubAgent ? session.lastSubagentType : undefined,
-        resolve: wrappedResolve,
-      });
+      // ExitPlanMode is surfaced via the dedicated plan_approval card (sdkAdapter), and the
+      // plan-approval / exit-plan keypress handlers resolve this pending permission. Skip the
+      // generic permission_request card here to avoid a duplicate prompt next to the plan card.
+      if (toolName !== 'ExitPlanMode') {
+        this.events.onPermissionRequest({
+          sessionId,
+          toolName,
+          toolUseId: options.toolUseID,
+          toolInput,
+          title: options.title,
+          description: options.description,
+          agentId,
+          isSubAgent,
+          agentLabel: isSubAgent ? session.lastSubagentType : undefined,
+          resolve: wrappedResolve,
+        });
+      }
 
       // Publish the session list so the phone immediately shows a visible "waiting_permission"
       // state (getSessions() derives it from pendingPermissions.size). Without this the phone never

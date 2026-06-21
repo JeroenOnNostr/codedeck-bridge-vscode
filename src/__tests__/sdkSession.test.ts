@@ -316,6 +316,72 @@ describe('SdkSessionManager', () => {
     });
   });
 
+  describe('handlePermission — ExitPlanMode card suppression', () => {
+    // handlePermission is private; the returned promise stays pending until the permission is
+    // resolved/timed out, so we never await it directly — we resolve it explicitly to clean up.
+    function callHandlePermission(toolName: string, toolInput: Record<string, unknown>, toolUseID: string) {
+      const session = (sdk as any).sessions.get(SESSION_ID);
+      return (sdk as any).handlePermission(SESSION_ID, session, toolName, toolInput, {
+        toolUseID,
+        title: `${toolName} title`,
+        description: '',
+      }) as Promise<PermissionResult>;
+    }
+
+    it('registers the ExitPlanMode permission but does NOT publish a generic permission_request card', () => {
+      // Session is created in 'plan' mode (beforeEach), so this reaches the forward block.
+      const pending = callHandlePermission('ExitPlanMode', { plan: 'do the thing' }, 'tu_exit');
+      // No duplicate generic card — the dedicated plan_approval card is the sole UI.
+      expect(events.onPermissionRequest).not.toHaveBeenCalled();
+      // But the permission IS registered so the plan-approval / exit-plan keypress can resolve it.
+      expect(sdk.findPendingPermission(SESSION_ID, 'ExitPlanMode')).toBe('tu_exit');
+      // waiting_permission state is still published (derived from pendingPermissions.size).
+      expect(events.onSessionListChanged).toHaveBeenCalled();
+      // Resolve to clear the pending promise/timeout.
+      sdk.resolvePermission(SESSION_ID, 'tu_exit', false);
+      return pending;
+    });
+
+    it('still publishes a generic permission_request card for normal tools', () => {
+      const pending = callHandlePermission('Bash', { command: 'ls' }, 'tu_bash');
+      expect(events.onPermissionRequest).toHaveBeenCalledTimes(1);
+      expect(sdk.findPendingPermission(SESSION_ID, 'Bash')).toBe('tu_bash');
+      sdk.resolvePermission(SESSION_ID, 'tu_bash', false);
+      return pending;
+    });
+  });
+
+  describe('nextSeq — CDB-025: out-of-band entries must not collide on a shared seq', () => {
+    it('returns distinct, monotonically increasing, non-zero seqs', () => {
+      // The old bug published every permission card with a constant seq: 0; the phone's per-seq
+      // dedup then dropped the 2nd+ card. Each allocation must be unique and > 0.
+      const a = sdk.nextSeq(SESSION_ID);
+      const b = sdk.nextSeq(SESSION_ID);
+      const c = sdk.nextSeq(SESSION_ID);
+      expect(a).toBeGreaterThan(0);
+      expect(b).toBeGreaterThan(a);
+      expect(c).toBeGreaterThan(b);
+      expect(new Set([a, b, c]).size).toBe(3);
+    });
+
+    it('gives a second permission card its own seq (the exact wedge repro)', () => {
+      // Sub-agent write card, then parent read card, in one session — both must survive.
+      const firstCard = sdk.nextSeq(SESSION_ID);
+      const secondCard = sdk.nextSeq(SESSION_ID);
+      expect(secondCard).not.toBe(firstCard);
+    });
+
+    it('shares the counter with normal output so an out-of-band entry never reuses a stream seq', () => {
+      const session = (sdk as any).sessions.get(SESSION_ID);
+      session.seqCounter = 7; // pretend 7 stream entries have been emitted
+      expect(sdk.nextSeq(SESSION_ID)).toBe(8);
+    });
+
+    it('returns 0 (fail-safe) for an unknown session', () => {
+      expect(sdk.nextSeq('no-such-session')).toBe(0);
+    });
+  });
+
   describe('setEffortLevel', () => {
     it('passes low/medium/high/xhigh through unchanged', async () => {
       for (const level of ['low', 'medium', 'high', 'xhigh'] as const) {

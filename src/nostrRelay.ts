@@ -415,7 +415,7 @@ export class NostrRelay {
    * Publish session list as a NIP-33 replaceable event.
    * Kind 30515 with d-tag = machine name ensures relays keep only the latest.
    *
-   * Debounced (500ms) to coalesce rapid-fire calls (e.g. activation + oneose).
+   * Debounced (150ms) to coalesce rapid-fire calls (e.g. activation + oneose).
    * Pauses output publishing while in progress to avoid relay rate-limits.
    * Retries once after 3s if all relays reject the publish.
    */
@@ -452,7 +452,7 @@ export class NostrRelay {
 
         await this.doPublishSessionListWithRetry(toPublish);
         resolve();
-      }, 500);
+      }, 150);
     });
   }
 

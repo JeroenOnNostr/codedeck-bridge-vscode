@@ -85,7 +85,10 @@ export class BridgeCore {
             agent_label: request.agentLabel,
           },
         };
-        this.relay.publishOutput(request.sessionId, [{ seq: 0, entry }]).catch(err => {
+        // Unique per-session seq (CDB-025): a constant seq collides with the phone's per-seq
+        // dedup, so a session's 2nd+ permission card would be dropped → "waiting" pill with no
+        // tappable card → wedged turn.
+        this.relay.publishOutput(request.sessionId, [{ seq: this.sdk.nextSeq(request.sessionId), entry }]).catch(err => {
           console.error('[Codedeck] Failed to publish permission request:', err);
         });
       },
@@ -115,7 +118,7 @@ export class BridgeCore {
           timestamp: new Date().toISOString(),
           metadata: { special: 'auth_error' },
         };
-        this.relay.publishOutput(sessionId, [{ seq: 0, entry }]).catch(err => {
+        this.relay.publishOutput(sessionId, [{ seq: this.sdk.nextSeq(sessionId), entry }]).catch(err => {
           console.error('[Codedeck] Failed to publish auth error:', err);
         });
         this.relay.publishSessionFailed(sessionId, 'auth-failed').catch(err => {
@@ -133,7 +136,7 @@ export class BridgeCore {
     this.sdk.onDeviceScreenshot = async (sessionId, artifactPath, serial) => {
       const built = buildScreenshotEntry(artifactPath, serial);
       if (!built) return 'capture saved but image could not be read';
-      await this.relay.publishOutput(sessionId, [{ seq: 0, entry: built.entry as OutputEntry }]).catch((err) => {
+      await this.relay.publishOutput(sessionId, [{ seq: this.sdk.nextSeq(sessionId), entry: built.entry as OutputEntry }]).catch((err) => {
         console.error('[Codedeck] Failed to publish screenshot:', err);
       });
       // Best-effort cleanup of the on-disk artifact (it's already delivered).
@@ -257,15 +260,22 @@ export class BridgeCore {
           }
         }
 
-        // Exit plan mode (plan-less ExitPlanMode): key '1' = yes, exit plan mode
+        // Exit plan mode (plan-less ExitPlanMode): resolve the pending ExitPlanMode permission
+        // ourselves — the generic permission card is suppressed for ExitPlanMode, so this card
+        // is the only thing that can resolve the SDK promise (mirrors the 'plan-approval' path).
         if (context === 'exit-plan') {
+          const tid = this.sdk.findPendingPermission(sessionId, 'ExitPlanMode');
           if (key === '1') {
+            // Yes — exit plan mode
+            if (tid) this.sdk.resolvePermission(sessionId, tid, true);
             await this.sdk.setPermissionMode(sessionId, 'default');
             this.relay.publishModeConfirmed(sessionId, 'default').catch(err => {
               log(`[Codedeck] Failed to publish mode-confirmed: ${err}`);
             });
+          } else if (key === '2') {
+            // No — stay in plan mode (deny ExitPlanMode so the SDK promise resolves)
+            if (tid) this.sdk.resolvePermission(sessionId, tid, false);
           }
-          // key '2' = No, stay in plan mode — no action needed
         }
       },
       onModeChange: async (sessionId, mode) => {
