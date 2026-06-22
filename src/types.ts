@@ -19,6 +19,13 @@ export interface RemoteSessionInfo {
   permissionMode?: PermissionMode;
   effortLevel?: EffortLevel;
   model?: string;
+  /**
+   * Real context-window size (tokens) the SDK resolved for this session — the honest
+   * denominator for the phone's context-usage %. Reported by the SDK's `modelUsage`
+   * (`ModelUsage.contextWindow`), so it reflects the actual 1M-beta window when active,
+   * not a guess from the model-id string. Absent until the first result message arrives.
+   */
+  contextWindow?: number;
   committed?: boolean;
   state?: 'idle' | 'running' | 'waiting_permission' | 'waiting_question';
 }
@@ -385,9 +392,11 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  * v1 = supports per-session model selection (`model` / `model-confirmed`) and the widened
  * effort set (`xhigh`). v2 = supports the auto-pairing handshake (`pair-request` / `pair-ack`).
  * v3 = supports subscription usage snapshots (`usage-request` / `usage`).
+ * v4 = reports the SDK-resolved context-window size per session (`RemoteSessionInfo.contextWindow`),
+ *      letting the phone use the real 1M-beta denominator instead of guessing from the model id.
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 // --- Nostr event kinds ---
 

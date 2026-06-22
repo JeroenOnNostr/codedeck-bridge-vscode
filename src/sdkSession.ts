@@ -262,6 +262,10 @@ interface ManagedSession {
   effortLevel?: EffortLevel;
   /** Selected Claude model ID (e.g. 'claude-opus-4-8') — tracked so getSessions() can report it and resume can re-apply it. */
   model?: string;
+  /** SDK-resolved context-window size (tokens) for this session — the honest denominator for the
+   *  phone's context-usage %. Captured from result messages' `modelUsage[...].contextWindow`, so it
+   *  reflects the real 1M-beta window when active. Undefined until the first result arrives. */
+  contextWindow?: number;
   /** Output entries history for catch-up. */
   history: Array<{ seq: number; entry: OutputEntry }>;
   /** Pending permission requests awaiting phone response, keyed by toolUseId. */
@@ -732,6 +736,7 @@ export class SdkSessionManager {
         committed: s.committed || undefined,
         effortLevel: s.effortLevel,
         model: s.model,
+        contextWindow: s.contextWindow,
         state: s.pendingPermissions.size > 0 ? 'waiting_permission'
           : s.pendingQuestions.size > 0 ? 'waiting_question'
           : s.sessionState,
@@ -961,6 +966,22 @@ export class SdkSessionManager {
         if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'session_state_changed') {
           const stateMsg = msg as SDKSessionStateChangedMessage;
           session.sessionState = stateMsg.state === 'idle' ? 'idle' : 'running';
+        }
+
+        // Capture the SDK-resolved context window from result messages so the phone can use the
+        // real denominator (e.g. the 1M-beta window) for its context-usage %, instead of guessing
+        // from the model-id string. `modelUsage` is keyed by model id; prefer the main session
+        // model, else fall back to the largest window reported (sub-agents may run other models).
+        if (msg.type === 'result') {
+          const modelUsage = (msg as { modelUsage?: Record<string, { contextWindow?: number }> }).modelUsage;
+          if (modelUsage) {
+            const cw = (session.model && modelUsage[session.model]?.contextWindow)
+              || Math.max(0, ...Object.values(modelUsage).map((u) => u?.contextWindow ?? 0));
+            if (cw > 0 && cw !== session.contextWindow) {
+              session.contextWindow = cw;
+              this.events.onSessionListChanged(this.getSessions());
+            }
+          }
         }
 
         const entries = sdkMessageToEntries(msg);

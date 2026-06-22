@@ -85,6 +85,28 @@ describe('Protocol types', () => {
       expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(3);
     });
 
+    it('protocol version is at least 4 (per-session context-window reporting)', () => {
+      expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(4);
+    });
+
+    it('round-trips a session list carrying contextWindow (bridge → phone)', () => {
+      const msg: SessionListMessage = {
+        type: 'sessions',
+        machine: 'laptop',
+        sessions: [{
+          id: 's1', slug: 'session-s1', cwd: '/repo', lastActivity: '2026-06-22T00:00:00Z',
+          lineCount: 0, title: 'test', project: 'repo',
+          model: 'claude-opus-4-8', contextWindow: 1_000_000,
+        }],
+        protocolVersion: PROTOCOL_VERSION,
+      };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      expect(parsed.type).toBe('sessions');
+      if (parsed.type === 'sessions') {
+        expect(parsed.sessions[0].contextWindow).toBe(1_000_000);
+      }
+    });
+
     it('round-trips a pair-ack message (bridge → phone)', () => {
       const ok: PairAckMessage = { type: 'pair-ack', machine: 'laptop', ok: true };
       const parsedOk: BridgeOutbound = JSON.parse(JSON.stringify(ok));
