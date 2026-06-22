@@ -240,6 +240,66 @@ describe('SdkSessionManager', () => {
     });
   });
 
+  // Universal stuck-session guard: while a turn is blocked on a pending AskUserQuestion, ANY input
+  // can only be the answer to it. sendInput must funnel it to the question resolver instead of
+  // queuing it behind the blocked turn (the wedge). This makes the bridge authoritative regardless
+  // of how the phone routed the text — permanently closing the answer-leak class.
+  describe('sendInput — routes to the pending question (universal wedge guard)', () => {
+    it('resolves a pending question when text arrives via the plain input path', async () => {
+      const resultPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_guard1', [
+        { label: 'Option A' },
+      ], 'Deliverable');
+
+      // Phone mis-routed this as a regular message (e.g. via sendMessage) — the bridge catches it.
+      const sent = sdk.sendInput(SESSION_ID, 'just a bullet list please');
+      expect(sent).toBe(true);
+
+      const result = await resultPromise;
+      expect(result.behavior).toBe('allow');
+      if (result.behavior === 'allow') {
+        expect(result.updatedInput!.answers).toEqual({ 'What should I do?': 'just a bullet list please' });
+      }
+    });
+
+    it('collects a multi-question group answered entirely via sendInput, in order (the exact wedge)', async () => {
+      const sessions = (sdk as any).sessions as Map<string, any>;
+      const session = sessions.get(SESSION_ID);
+      const q0 = { question: 'Deliverable?', header: 'Q0', options: [{ label: 'a0' }] };
+      const q1 = { question: 'Show weights?', header: 'Q1', options: [{ label: 'b1' }] };
+      const q2 = { question: 'Detail level?', header: 'Q2', options: [{ label: 'c2' }] };
+      for (const [idx, q] of [q0, q1, q2].entries()) {
+        session.history.push({
+          seq: ++session.seqCounter,
+          entry: {
+            entryType: 'system', content: q.question, timestamp: new Date().toISOString(),
+            metadata: { special: 'ask_question', tool_use_id: 'grp', header: q.header, options: q.options, question_index: idx, question_count: 3 },
+          },
+        });
+      }
+      const resultPromise = new Promise<PermissionResult>((resolve) => {
+        session.pendingQuestions.set('grp', {
+          input: { questions: [q0, q1, q2] }, questions: [q0, q1, q2], answers: {}, remaining: 3, resolve,
+        });
+      });
+
+      // All three answers arrive as plain input (what leaked before the fix). The group still resolves.
+      expect(sdk.sendInput(SESSION_ID, 'minimal')).toBe(true);
+      expect(sdk.sendInput(SESSION_ID, 'with weights')).toBe(true);
+      expect(sdk.sendInput(SESSION_ID, 'taxonomy only')).toBe(true);
+
+      const result = await resultPromise;
+      expect(result.behavior).toBe('allow');
+      if (result.behavior === 'allow') {
+        expect(result.updatedInput!.answers).toEqual({
+          'Deliverable?': 'minimal',
+          'Show weights?': 'with weights',
+          'Detail level?': 'taxonomy only',
+        });
+      }
+      expect(session.pendingQuestions.size).toBe(0);
+    });
+  });
+
   // Regression guard for CDB-022: SDK 0.3.177 changed the AskUserQuestion answer
   // contract. The host must return updatedInput = original input (with `questions`)
   // PLUS `answers` keyed by the full question text. The old shape

@@ -433,6 +433,17 @@ export class SdkSessionManager {
     const session = this.sessions.get(sessionId);
     if (!session || !session.alive) { return false; }
 
+    // Universal stuck-session guard: while a turn is blocked on a pending AskUserQuestion, the SDK
+    // cannot advance until that question is answered — so any input arriving now can ONLY be the
+    // answer to it. Route it through the question path instead of pushing it onto the input channel,
+    // where it would sit unprocessed behind the blocked turn forever (the classic wedge). This makes
+    // the bridge authoritative no matter how the phone routed the text, permanently closing the whole
+    // answer-leak class. Not recursive: sendQuestionInput only falls back to sendInput when NO
+    // question is pending, which is the opposite of the condition here.
+    if (session.pendingQuestions.size > 0) {
+      return this.sendQuestionInput(sessionId, text);
+    }
+
     session.lastActivity = new Date().toISOString();
 
     // Extract title from first user message and ask Claude for structured metadata
