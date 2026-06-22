@@ -26,6 +26,13 @@ export interface RemoteSessionInfo {
    * not a guess from the model-id string. Absent until the first result message arrives.
    */
   contextWindow?: number;
+  /**
+   * Authoritative context-window usage as a 0–100 integer percentage, read straight from the
+   * Agent SDK's `query.getContextUsage().percentage` — the exact meter the Claude Code terminal
+   * shows. Preferred over the phone reconstructing `tokens / contextWindow` (which races a
+   * late-learned denominator and jumps). Absent on pre-v5 bridges / before the first result.
+   */
+  contextPercentage?: number;
   committed?: boolean;
   state?: 'idle' | 'running' | 'waiting_permission' | 'waiting_question';
 }
@@ -394,9 +401,12 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  * v3 = supports subscription usage snapshots (`usage-request` / `usage`).
  * v4 = reports the SDK-resolved context-window size per session (`RemoteSessionInfo.contextWindow`),
  *      letting the phone use the real 1M-beta denominator instead of guessing from the model id.
+ * v5 = reports the SDK's authoritative context-usage percentage per session
+ *      (`RemoteSessionInfo.contextPercentage`, from `query.getContextUsage()`) — the same meter the
+ *      Claude Code terminal shows, so the phone displays it directly instead of reconstructing it.
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 // --- Nostr event kinds ---
 

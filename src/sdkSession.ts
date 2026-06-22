@@ -22,6 +22,7 @@ import type {
   SDKSystemMessage,
   SDKSessionStateChangedMessage,
   SDKControlGetUsageResponse,
+  SDKControlGetContextUsageResponse,
   PermissionResult,
   PermissionUpdate,
   PermissionMode,
@@ -266,6 +267,9 @@ interface ManagedSession {
    *  phone's context-usage %. Captured from result messages' `modelUsage[...].contextWindow`, so it
    *  reflects the real 1M-beta window when active. Undefined until the first result arrives. */
   contextWindow?: number;
+  /** Authoritative context-usage % (0–100) from the SDK's `query.getContextUsage()` — the same
+   *  meter the Claude Code terminal shows. Refreshed after each result. Undefined until then. */
+  contextPercentage?: number;
   /** Output entries history for catch-up. */
   history: Array<{ seq: number; entry: OutputEntry }>;
   /** Pending permission requests awaiting phone response, keyed by toolUseId. */
@@ -701,6 +705,29 @@ export class SdkSessionManager {
     }
   }
 
+  /**
+   * Authoritative context-window usage from the SDK — the same meter the Claude Code terminal
+   * shows. `getContextUsage` is a typed method on the Query interface, but the underlying Claude
+   * Code binary may not implement the control request, so feature-detect + try/catch like getUsage.
+   * Returns the 0–100 percentage (rounded), or null if unavailable.
+   */
+  async getContextUsage(sessionId: string): Promise<number | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.alive) { return null; }
+
+    const fn = (session.query as Partial<Pick<Query, 'getContextUsage'>>).getContextUsage;
+    if (typeof fn !== 'function') { return null; }
+
+    try {
+      const res: SDKControlGetContextUsageResponse = await fn.call(session.query);
+      if (typeof res?.percentage !== 'number' || !isFinite(res.percentage)) { return null; }
+      return Math.max(0, Math.min(100, Math.round(res.percentage)));
+    } catch (err) {
+      this.events.log(`[SDK] getContextUsage failed for ${sessionId}: ${err}`);
+      return null;
+    }
+  }
+
   /** Close a session. */
   closeSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
@@ -737,6 +764,7 @@ export class SdkSessionManager {
         effortLevel: s.effortLevel,
         model: s.model,
         contextWindow: s.contextWindow,
+        contextPercentage: s.contextPercentage,
         state: s.pendingPermissions.size > 0 ? 'waiting_permission'
           : s.pendingQuestions.size > 0 ? 'waiting_question'
           : s.sessionState,
@@ -982,6 +1010,17 @@ export class SdkSessionManager {
               this.events.onSessionListChanged(this.getSessions());
             }
           }
+
+          // Refresh the SDK's authoritative context-usage % (the meter the Claude Code terminal
+          // shows) — context only changes at turn boundaries, so per-result is the right cadence.
+          // Fire-and-forget so it never blocks stream processing; republish on change.
+          void this.getContextUsage(sessionId).then((pct) => {
+            const s = this.sessions.get(sessionId);
+            if (s && s.alive && pct !== null && pct !== s.contextPercentage) {
+              s.contextPercentage = pct;
+              this.events.onSessionListChanged(this.getSessions());
+            }
+          });
         }
 
         const entries = sdkMessageToEntries(msg);
