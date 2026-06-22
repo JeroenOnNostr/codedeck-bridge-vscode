@@ -1,5 +1,9 @@
 # Done — Codedeck Bridge (VSCode Extension)
 
+## SDK context-usage % to the phone (2026-06-23, protocol v5)
+
+- [x] **CDB-026: Advertise the SDK's authoritative context-usage % (protocol v5)** — The phone reconstructed its context-% badge as `tokens / contextWindow`, which jumped because the denominator was learned late (see phone CD-044). The Agent SDK already computes the exact meter the Claude Code terminal shows, via `query.getContextUsage().percentage`. New `SdkSessionManager.getContextUsage(sessionId)` mirrors `getUsage()` (feature-detect + try/catch — `getContextUsage` is typed on the `Query` interface but older Claude Code binaries may not implement the control request) and returns the rounded 0–100 percentage. Called fire-and-forget right after each `result` message (context only changes at turn boundaries) in the same block that captures `contextWindow`; stores `session.contextPercentage` and republishes the session list on change. `RemoteSessionInfo.contextPercentage` added; `PROTOCOL_VERSION` 4 → 5. Bridge-only; `tsc` clean; 140 tests pass. (commit `718c9dc`, 2026-06-23)
+
 ## Plan & permission card fixes (2026-06-21, v2026.6.212)
 
 - [x] **CDB-024: Duplicate ExitPlanMode permission card alongside plan-approval card** — When an agent proposed a plan, the phone showed both the dedicated "Approve this plan?" card AND a redundant generic "ExitPlanMode — Permission needed" card, because `canUseTool`/`handlePermission` published a `permission_request` entry for the same tool the `sdkAdapter` already surfaced as a `plan_approval` card. Fix (`sdkSession.ts` + `core.ts`): suppress the generic `onPermissionRequest` for `ExitPlanMode` (keep the pending permission registered + `waiting_permission` state), and make the no-plan `exit-plan` keypress resolve the pending permission itself so it no longer relies on the generic card. Bridge-only; no phone-app rebuild. Tests added in `sdkSession.test.ts`. (commit `e2efc6a`, 2026-06-21)
