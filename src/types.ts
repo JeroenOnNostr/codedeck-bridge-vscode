@@ -317,6 +317,64 @@ export interface UsageMessage {
   usage: UsageData;
 }
 
+// --- GSD workflow state (see gsdState.ts) ---
+
+/**
+ * One roadmap phase. `diskStatus` is GSD's own vocabulary — the phone maps it onto the
+ * Discuss/Plan/Execute stage triple (see gsd-core `workflows/manager.md`):
+ *   complete | executed | partial | planned | discussed | researched | empty | no_directory
+ */
+export interface GsdPhase {
+  number: string;
+  name: string;
+  diskStatus: string;
+  plans: number;
+  summaries: number;
+  /** GSD's `is_active`: a file in the phase dir changed <5 min ago. NOT agent liveness. */
+  recentlyTouched: boolean;
+  /** Per-phase next step, e.g. 'execute' — absent when GSD recommends nothing for this phase. */
+  action: string | null;
+  /** Ready-to-send slash command for that step, e.g. '/gsd-execute-phase 2'. */
+  command: string | null;
+}
+
+/** A workflow-level action the phone can fire by sending `command` as ordinary input. */
+export interface GsdAction {
+  id: string;
+  label: string;
+  command: string;
+  recommended: boolean;
+}
+
+/** Snapshot of a session's GSD position. `available: false` → phone renders nothing. */
+export interface GsdState {
+  available: boolean;
+  /** no-project | needs-first-phase | planning | executing | verify-pending | … */
+  situation: string;
+  summary: string;
+  milestone: string | null;
+  currentPhase: string | null;
+  totalPhases: number | null;
+  percent: number;
+  phases: GsdPhase[];
+  actions: GsdAction[];
+  /** id of the recommended entry in `actions`. */
+  recommended: string | null;
+}
+
+/** Phone → bridge: request a fresh GSD snapshot for a session. */
+export interface GsdRequestMessage {
+  type: 'gsd-request';
+  sessionId: string;
+}
+
+/** Bridge → phone: GSD snapshot for a session. */
+export interface GsdStateMessage {
+  type: 'gsd-state';
+  sessionId: string;
+  gsd: GsdState;
+}
+
 // --- Credentials (phone → bridge) ---
 
 export interface SetCredentialsMessage {
@@ -390,8 +448,8 @@ export interface PairAckMessage {
 
 // --- Union ---
 
-export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | UsageMessage | CredentialsAckMessage | PairAckMessage;
-export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | UsageRequestMessage | SetCredentialsMessage | SetDeviceConfigMessage | PairRequestMessage;
+export type BridgeOutbound = SessionListMessage | OutputMessage | HistoryResponseMessage | SessionPendingMessage | SessionReadyMessage | SessionFailedMessage | InputFailedMessage | CloseSessionAckMessage | SessionReplacedMessage | ModeConfirmedMessage | EffortConfirmedMessage | ModelConfirmedMessage | UsageMessage | GsdStateMessage | CredentialsAckMessage | PairAckMessage;
+export type BridgeInbound = InputMessage | QuestionInputMessage | PermissionResponseMessage | KeypressMessage | ModeChangeMessage | EffortChangeMessage | ModelChangeMessage | HistoryRequestMessage | CreateSessionMessage | RefreshSessionsMessage | CloseSessionMessage | UploadImageMessage | InterruptMessage | UsageRequestMessage | GsdRequestMessage | SetCredentialsMessage | SetDeviceConfigMessage | PairRequestMessage;
 export type BridgeMessage = BridgeOutbound | BridgeInbound;
 
 /**
@@ -404,9 +462,11 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  * v5 = reports the SDK's authoritative context-usage percentage per session
  *      (`RemoteSessionInfo.contextPercentage`, from `query.getContextUsage()`) — the same meter the
  *      Claude Code terminal shows, so the phone displays it directly instead of reconstructing it.
+ * v6 = supports GSD stage snapshots (`gsd-request` / `gsd-state`), letting the phone render a
+ *      workflow strip for sessions whose cwd is a GSD project.
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 // --- Nostr event kinds ---
 
