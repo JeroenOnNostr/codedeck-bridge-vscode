@@ -2,6 +2,8 @@
 
 ## GSD integration
 
+- [x] **CDB-032: widen the GSD snapshot — `installed`, live execution, recovery signals, pre-flight (protocol v7)** — ✅ code + tests done, **device-verify owed** (covered by CD-053's run-sheet; this side has no separate UI). `gsdState.ts` now also runs `query phase-plan-index N` (capped at 3, only for phases GSD wants executed) and `git log`, reconstructing task-level progress from GSD's atomic `type(phase-plan): desc` commits — the only thing that moves during a parallel wave. Two live-CLI corrections landed with it: `smart-entry`'s `current_phase` arrives as a **number** (must be coerced or the phone's current-phase highlight silently never fires), and `has_checkpoints` is derived from `autonomous: false` alone, so counting non-autonomous plans supersedes it. 162 tests.
+
 - [x] **CDB-031: Serve GSD workflow state to the phone (`gsd-request` / `gsd-state`)** — ✅ code + tests done, device-verify owed.
   New `src/gsdState.ts` shells out to GSD's own CLI (`~/.claude/gsd-core/bin/gsd-tools.cjs`) for a session's
   `cwd` and returns a `GsdState` snapshot; `core.ts onGsdRequest` publishes it via `nostrRelay.publishGsdState`
