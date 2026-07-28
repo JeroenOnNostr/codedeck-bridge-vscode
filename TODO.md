@@ -2,24 +2,38 @@
 
 ## GSD integration
 
-- [ ] **CDB-033: a session can only ever be rooted at `workspaceFolders[0]`** — the blocker that made
-  CD-053 untestable end-to-end. `extension.ts:74` is
-  `const workspaceCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;` — always folder `[0]`,
-  with no way to choose. `nostr-apps.code-workspace` declares exactly one folder (`"path": "."`), so
-  **every** CodeDeck session on this machine is rooted at the multi-project workspace root, which is
-  not a git repo and holds 27 sibling repos. The New Session sheet's `WORKSPACE` field therefore has
-  one option and is decorative.
-  *Consequence:* GSD can never be driven from the phone against a real project — `Start GSD` can only
-  target the root, where it would `git init` over 27 repos (see **CD-056**). A full GSD lifecycle test
-  on 2026-07-28 had to be run from a terminal-side session instead of by tapping the strip, so no
-  strip state (waiting / executing / recovery / idle) has ever actually been observed.
-  *Fix:* let a session carry an explicit `cwd`. Cheapest version: make the existing `WORKSPACE` picker
-  select among `workspaceFolders[n]` and pass the choice through to `sdkSession`. Better: allow an
-  arbitrary subdirectory, since `gsd-tools --cwd` already walks up to the project root
-  (`gsdState.ts:277`), so a subdir cwd works for GSD without further changes.
-  *Note:* `gsdEnabledSessions` is keyed by `sessionId` (`sessionStore.ts:75`, `:1100`), so the GSD
-  opt-in evaporates on every new session for the same repo. Keying it by `cwd` instead would make the
-  opt-in stick per project and remove most of the need for a New Session checkbox.
+- [x] **CDB-033: a session can only ever be rooted at `workspaceFolders[0]`** — ✅ code + tests done,
+  **device-verify owed**. Fixed in `46926e4` (+ phone `3f29615`): `create-session` takes an optional
+  `cwd`, and `resolveSessionCwd()` confines it to the workspace root — containment is checked on
+  path *segments*, never `startsWith` (or `/ws/app-2` would pass as inside `/ws/app`), the target
+  must already exist as a directory, and anything else logs and falls back to the root so a stale
+  bookmark on the phone cannot make sessions un-creatable. The phone gained a **Project folder**
+  field on the New Session sheet (blank = workspace root). Protocol **v8**. 174 tests (+12).
+
+  <details><summary>Device-verification run-sheet</summary>
+
+  **Preconditions.** Laptop running this bridge build; phone on `3f29615`+. The VSCode workspace is
+  the multi-project root (`nostr-apps.code-workspace`, one folder: `.`), which is the whole point —
+  `gsd-testbed/` is a real git repo inside it.
+
+  **Steps + pass oracle.**
+  1. New Session with **Project folder** left blank. → Session cwd is the workspace root, exactly as
+     before. This is the compatibility case; if it regresses, every existing session breaks.
+  2. New Session with **Project folder** = `gsd-testbed`. → The bridge log shows
+     `Create session request … (cwd: gsd-testbed)` and the session's cwd is
+     `<workspace>/gsd-testbed`. The GSD strip then shows that project's real state
+     (`Phase 1/5 · 20%` — see CD-054), **not** the workspace root's "GSD not set up here".
+     **Pre-fix: this was impossible — every session landed on the root, which is why the strip had
+     never once been driven against a real GSD project.**
+  3. New Session with **Project folder** = `../` or `/etc`. → Bridge log shows
+     `Rejected session cwd outside the workspace`, and the session opens at the root rather than
+     failing. Confinement is the security property here; an escape is a hard fail.
+  4. New Session with **Project folder** = `does-not-exist`. → Log shows
+     `Session cwd does not exist`, session opens at the root.
+  5. Kill the bridge mid-create and let the phone's optimistic retry fire. → The retried create
+     carries the same `cwd` (it is stored on the optimistic record), not a silent fallback to root.
+  </details>
+
 
 - [x] **CDB-032: widen the GSD snapshot — `installed`, live execution, recovery signals, pre-flight (protocol v7)** — ✅ code + tests done, **device-verify owed** (covered by CD-053's run-sheet; this side has no separate UI). `gsdState.ts` now also runs `query phase-plan-index N` (capped at 3, only for phases GSD wants executed) and `git log`, reconstructing task-level progress from GSD's atomic `type(phase-plan): desc` commits — the only thing that moves during a parallel wave. Two live-CLI corrections landed with it: `smart-entry`'s `current_phase` arrives as a **number** (must be coerced or the phone's current-phase highlight silently never fires), and `has_checkpoints` is derived from `autonomous: false` alone, so counting non-autonomous plans supersedes it. 162 tests.
 
