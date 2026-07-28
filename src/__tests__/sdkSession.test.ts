@@ -305,6 +305,71 @@ describe('SdkSessionManager', () => {
   // PLUS `answers` keyed by the full question text. The old shape
   // (`{ answers: { [header]: label } }`, no questions) crashed the SDK's Bun/JSC
   // result builder with "undefined is not an object (evaluating 'H.map')".
+  /**
+   * CDB-034 — the bridge appends `<!-- emit-session-meta: ... -->` to a session's first message to
+   * get a topic/project label back. Claude Code treats EVERYTHING after a slash command's name as
+   * that command's `$ARGUMENTS`, so doing that to `/gsd-plan-phase 2` quietly asks for phase
+   * "2\n\n<!-- emit-session-meta: … -->". This is exactly the path CodeDeck's GSD strip uses for
+   * every tap, and a session started by tapping one starts with a slash command.
+   */
+  describe('sendInput — session-meta must not rewrite a slash command\'s arguments', () => {
+    /** The text actually handed to the SDK for the last pushed message. */
+    function lastPushed(): string {
+      const session = (sdk as any).sessions.get(SESSION_ID);
+      const queue = (session.input as any);
+      // createInputChannel keeps its queue in a closure; capture through the push spy instead.
+      return queue.__lastText as string;
+    }
+
+    beforeEach(() => {
+      const session = (sdk as any).sessions.get(SESSION_ID);
+      const realPush = session.input.push.bind(session.input);
+      session.input.push = (msg: any) => {
+        (session.input as any).__lastText = msg.message.content;
+        realPush(msg);
+      };
+    });
+
+    it('leaves a slash command byte-identical', () => {
+      sdk.sendInput(SESSION_ID, '/gsd-new-project');
+      expect(lastPushed()).toBe('/gsd-new-project');
+    });
+
+    it('leaves a slash command WITH arguments byte-identical', () => {
+      sdk.sendInput(SESSION_ID, '/gsd-execute-phase 2');
+      expect(lastPushed()).toBe('/gsd-execute-phase 2');
+    });
+
+    it('still asks for metadata on the first ordinary message', () => {
+      sdk.sendInput(SESSION_ID, 'add a login page');
+      expect(lastPushed()).toContain('emit-session-meta');
+    });
+
+    it('still asks on the first ordinary message even when a command came first', () => {
+      // The ask is owed to the SESSION, not to the first input — a GSD session must not lose its
+      // topic/project labels forever just because it opened with a command.
+      sdk.sendInput(SESSION_ID, '/gsd-new-project');
+      sdk.sendInput(SESSION_ID, 'a habit tracker');
+      expect(lastPushed()).toContain('emit-session-meta');
+    });
+
+    it('asks only once', () => {
+      sdk.sendInput(SESSION_ID, 'first');
+      sdk.sendInput(SESSION_ID, 'second');
+      expect(lastPushed()).not.toContain('emit-session-meta');
+    });
+
+    it('titles the session from the command so the card is not blank', () => {
+      sdk.sendInput(SESSION_ID, '/gsd-new-project');
+      expect(sdk.getSessions().find(s => s.id === SESSION_ID)?.title).toBe('/gsd-new-project');
+    });
+
+    it('does not mistake a path or bare slash for a command', () => {
+      sdk.sendInput(SESSION_ID, '/home/jeroen/notes.md — read this');
+      expect(lastPushed()).toContain('emit-session-meta');
+    });
+  });
+
   describe('AskUserQuestion answer contract (SDK 0.3.177)', () => {
     it('echoes the original questions array and keys answers by question text', async () => {
       const resultPromise = injectQuestionHistory(sdk, SESSION_ID, 'tool_contract', [

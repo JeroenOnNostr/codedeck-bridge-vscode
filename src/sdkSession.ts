@@ -74,6 +74,18 @@ export function touchesSecretPath(toolName: string, toolInput: Record<string, un
   return SECRET_PATH_RE.test(haystack);
 }
 
+/**
+ * Is this input a slash command rather than prose? Claude Code treats the first token of such a
+ * message as the command and EVERYTHING after it as `$ARGUMENTS`, so anything the bridge appends
+ * to it changes what the command does (CDB-034).
+ *
+ * Deliberately strict: the command must be the very first thing in the message, and a bare `/`
+ * or a path-like `/home/...` is not a command.
+ */
+export function isSlashCommand(text: string): boolean {
+  return /^\/[A-Za-z][\w:-]*(\s|$)/.test(text);
+}
+
 /** Absolute path of the harness plan-authoring directory (`~/.claude/plans`, honoring CLAUDE_CONFIG_DIR). */
 function plansDirPath(): string {
   const env = process.env.CLAUDE_CONFIG_DIR;
@@ -293,6 +305,10 @@ interface ManagedSession {
   lastActivity: string;
   /** Title extracted from first user message. */
   title: string | null;
+  /** Whether the session-meta request has already been appended to an outgoing message (CDB-034).
+   *  Tracked separately from `title` so a session opened with a slash command still gets asked on
+   *  its first ordinary message. */
+  metaRequested?: boolean;
   /** Whether session-meta tag has been parsed. */
   summarized: boolean;
   /** Project name extracted from session-meta tag (overrides cwd-derived name). */
@@ -447,13 +463,20 @@ export class SdkSessionManager {
     session.lastActivity = new Date().toISOString();
 
     // Extract title from first user message and ask Claude for structured metadata
-    if (!session.title) {
-      const cleaned = text.replace(/\n/g, ' ').trim();
-      if (cleaned && !cleaned.startsWith('[') && !cleaned.startsWith('Request interrupted')) {
-        session.title = cleaned.length > 80 ? cleaned.slice(0, 77) + '...' : cleaned;
-        // Ask Claude to emit a metadata tag in its first response
-        text += '\n\n<!-- emit-session-meta: In your response, include exactly one HTML comment: <!-- session-meta: {"topic": "<2-4 word task summary>", "project": "<project name>"} --> -->';
-      }
+    const cleaned = text.replace(/\n/g, ' ').trim();
+    const usable = !!cleaned && !cleaned.startsWith('[') && !cleaned.startsWith('Request interrupted');
+    if (!session.title && usable) {
+      session.title = cleaned.length > 80 ? cleaned.slice(0, 77) + '...' : cleaned;
+    }
+    // CDB-034. Everything after a slash command's name is its ARGUMENTS, so appending the
+    // metadata request to one silently rewrites what the command was asked to do — `/gsd-plan-phase 2`
+    // arrives as phase `2\n\n<!-- emit-session-meta: … -->`. Ask on the next ordinary message
+    // instead; `metaRequested` (not `title`) is what tracks whether we still owe the ask, so a
+    // session whose first input was a command doesn't lose its topic/project labels forever.
+    if (!session.metaRequested && usable && !isSlashCommand(text)) {
+      session.metaRequested = true;
+      // Ask Claude to emit a metadata tag in its first response
+      text += '\n\n<!-- emit-session-meta: In your response, include exactly one HTML comment: <!-- session-meta: {"topic": "<2-4 word task summary>", "project": "<project name>"} --> -->';
     }
 
     session.input.push({
