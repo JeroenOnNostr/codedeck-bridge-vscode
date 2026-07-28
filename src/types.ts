@@ -336,6 +336,37 @@ export interface GsdPhase {
   action: string | null;
   /** Ready-to-send slash command for that step, e.g. '/gsd-execute-phase 2'. */
   command: string | null;
+  /** Total plans in the phase, from phase-plan-index. null = not computed for this phase. */
+  planCount: number | null;
+  /**
+   * Plans that will BLOCK on a human (checkpoint tasks or `autonomous: false`). The point of
+   * shipping this is pre-flight cost: "3 plans, 1 needs you" is the difference between starting
+   * a phase from a phone and waiting until you're at a desk. null = not computed.
+   */
+  needsYou: number | null;
+}
+
+/**
+ * Live progress inside a running phase.
+ *
+ * Exists because phase/plan status is USELESS during the longest activity: with
+ * `parallelization.enabled` (GSD's default) per-plan STATE.md writes are skipped inside
+ * worktrees and batched after the wave merges, so a 15-minute execute shows a frozen strip.
+ * GSD's executor commits every task atomically as `{type}({phase}-{plan}): {description}`,
+ * so the git log is a reliable live task feed that needs no GSD support at all.
+ */
+export interface GsdExecution {
+  phase: string;
+  plansTotal: number;
+  plansDone: number;
+  /** Plan currently in flight, e.g. '02-01'. */
+  currentPlan: string | null;
+  /** Task commits seen for the in-flight plan. */
+  tasksDone: number;
+  /** `<task>` tags in that plan, or null when the plan doesn't declare them. */
+  tasksTotal: number | null;
+  /** Subject of the newest task commit, e.g. 'add payment session'. */
+  lastTask: string | null;
 }
 
 /** A workflow-level action the phone can fire by sending `command` as ordinary input. */
@@ -346,8 +377,15 @@ export interface GsdAction {
   recommended: boolean;
 }
 
-/** Snapshot of a session's GSD position. `available: false` → phone renders nothing. */
+/** Snapshot of a session's GSD position. */
 export interface GsdState {
+  /**
+   * gsd-tools resolved on this machine. Distinct from `available` on purpose: a session the user
+   * has opted into needs to tell "GSD isn't installed, nothing to offer" apart from "GSD is here,
+   * this project just isn't set up yet" — only the latter can show a Start button.
+   */
+  installed: boolean;
+  /** This project has a `.planning/` directory, i.e. there is real workflow state to show. */
   available: boolean;
   /** no-project | needs-first-phase | planning | executing | verify-pending | … */
   situation: string;
@@ -357,9 +395,16 @@ export interface GsdState {
   totalPhases: number | null;
   percent: number;
   phases: GsdPhase[];
+  /** Populated even when `available` is false (then: new-project / map-codebase / quick / help). */
   actions: GsdAction[];
   /** id of the recommended entry in `actions`. */
   recommended: string | null;
+  // --- recovery signals: first-class states in GSD, each with a command to get out of them ---
+  paused: boolean;
+  blockers: string[];
+  verifyFailed: boolean;
+  /** Non-null only while a phase is actually being executed. See GsdExecution. */
+  execution: GsdExecution | null;
 }
 
 /** Phone → bridge: request a fresh GSD snapshot for a session. */
@@ -464,9 +509,13 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  *      Claude Code terminal shows, so the phone displays it directly instead of reconstructing it.
  * v6 = supports GSD stage snapshots (`gsd-request` / `gsd-state`), letting the phone render a
  *      workflow strip for sessions whose cwd is a GSD project.
+ * v7 = widens the GSD snapshot: `installed` (so an opted-in session can offer a Start button for
+ *      a not-yet-initialized project), live `execution` progress derived from GSD's atomic task
+ *      commits, recovery signals (`paused` / `blockers` / `verifyFailed`), and per-phase
+ *      pre-flight cost (`planCount` / `needsYou`).
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 // --- Nostr event kinds ---
 
