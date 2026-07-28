@@ -170,6 +170,14 @@ export interface CreateSessionMessage {
    * inside the workspace root, or the request falls back to the root.
    */
   cwd?: string;
+  /**
+   * Create `cwd` (and `git init` it) when it doesn't exist yet.
+   *
+   * This is what makes "start a new GSD project from the phone" possible at all — without it the
+   * folder has to already exist on the laptop, so the phone can only ever open projects someone
+   * else created. Still confined to the workspace root by the same containment check.
+   */
+  createCwd?: boolean;
 }
 
 // --- Refresh sessions (phone → bridge) ---

@@ -13,6 +13,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { NostrRelay, NostrRelayEvents } from './nostrRelay';
 import { SdkSessionManager } from './sdkSession';
 import { buildScreenshotEntry } from './screenshotDelivery';
@@ -35,6 +36,7 @@ export function resolveSessionCwd(
   root: string,
   requested: string | undefined,
   log: (m: string) => void = () => {},
+  opts: { create?: boolean } = {},
 ): string {
   const rootReal = path.resolve(root);
   if (!requested) return rootReal;
@@ -52,9 +54,38 @@ export function resolveSessionCwd(
       log(`[Codedeck] Session cwd is not a directory: ${resolved} → using ${rootReal}`);
       return rootReal;
     }
+    return resolved;
   } catch {
-    log(`[Codedeck] Session cwd does not exist: ${resolved} → using ${rootReal}`);
+    // Doesn't exist yet.
+    if (!opts.create) {
+      log(`[Codedeck] Session cwd does not exist: ${resolved} → using ${rootReal}`);
+      return rootReal;
+    }
+  }
+
+  // `create` is the "start a new project from the phone" path. Without it you could only ever root
+  // a session in a directory that already existed, so a new project had to be created on the laptop
+  // first — which defeats the point of starting one from the phone.
+  //
+  // It is `git init`-ed on creation, not left bare, because GSD's own new-project runs `git init`
+  // when the directory isn't a repo — and doing that HERE, in a directory we just made, is safe,
+  // whereas letting GSD do it at a multi-project root is the CD-056 hazard. It also means the
+  // phone's Start GSD button (gated on `hasGit`) is live immediately instead of dead on arrival.
+  try {
+    fs.mkdirSync(resolved, { recursive: true });
+    log(`[Codedeck] Created session cwd: ${resolved}`);
+  } catch (e) {
+    log(`[Codedeck] Could not create session cwd ${resolved}: ${e} → using ${rootReal}`);
     return rootReal;
+  }
+  try {
+    if (!fs.existsSync(path.join(resolved, '.git'))) {
+      execFileSync('git', ['-C', resolved, 'init', '--quiet'], { timeout: 10_000 });
+      log(`[Codedeck] git init ${resolved}`);
+    }
+  } catch (e) {
+    // A directory without a repo is still usable — GSD will just offer to init it itself.
+    log(`[Codedeck] git init failed in ${resolved}: ${e} (continuing)`);
   }
   return resolved;
 }
@@ -208,14 +239,14 @@ export class BridgeCore {
           });
         }
       },
-      onCreateSession: async (defaultEffort?, model?, testSession?, requestedCwd?) => {
+      onCreateSession: async (defaultEffort?, model?, testSession?, requestedCwd?, createCwd?) => {
         const sessionId = crypto.randomUUID();
         const effort = defaultEffort as EffortLevel | undefined;
         log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}${testSession ? ' [test session: device tools enabled]' : ''}${requestedCwd ? ` (cwd: ${requestedCwd})` : ''}`);
 
         try {
           const root = this.workspaceCwd || process.cwd();
-          const cwd = resolveSessionCwd(root, requestedCwd, log);
+          const cwd = resolveSessionCwd(root, requestedCwd, log, { create: !!createCwd });
           // Apply model + effort at query() construction so 'max'/'xhigh' take effect from the first turn.
           // testSession attaches the on-device adb MCP tools (Phase 2.3).
           this.sdk.createSession(sessionId, cwd, 'plan', model, effort, { testSession: !!testSession });

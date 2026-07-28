@@ -5,6 +5,7 @@ import * as path from 'path';
 import { touchesSecretPath, isBenignPlanDirWrite } from '../sdkSession';
 import { redactSecrets } from '../deviceActions';
 import { resolveSessionCwd } from '../core';
+import { execFileSync } from 'child_process';
 
 const PLANS_DIR = path.join(
   process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), '.claude'),
@@ -165,5 +166,63 @@ describe('resolveSessionCwd — session cwd confinement', () => {
 
   it('allows the root itself', () => {
     expect(resolveSessionCwd(root, '.')).toBe(path.resolve(root));
+  });
+});
+
+/**
+ * The "start a new project from the phone" path: `create` lets a named folder that doesn't exist
+ * yet be created and `git init`-ed. Containment still applies — creation must never be a way out
+ * of the workspace root.
+ */
+describe('resolveSessionCwd — create mode', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb033c-'));
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('creates a missing folder and initialises a git repo in it', () => {
+    const out = resolveSessionCwd(root, 'brand-new', () => {}, { create: true });
+    expect(out).toBe(path.join(path.resolve(root), 'brand-new'));
+    expect(fs.statSync(out).isDirectory()).toBe(true);
+    // git init matters: GSD's new-project would otherwise `git init` itself, and the phone's
+    // Start GSD button is gated on hasGit — a bare directory would arrive with the button dead.
+    expect(fs.existsSync(path.join(out, '.git'))).toBe(true);
+  });
+
+  it('creates nested folders in one go', () => {
+    const out = resolveSessionCwd(root, 'a/b/c', () => {}, { create: true });
+    expect(fs.statSync(out).isDirectory()).toBe(true);
+  });
+
+  it('refuses to create outside the workspace, even with create enabled', () => {
+    // The containment check must run BEFORE mkdir, or `create` becomes an arbitrary-write primitive.
+    const abs = path.resolve(root);
+    expect(resolveSessionCwd(root, '../escapee', () => {}, { create: true })).toBe(abs);
+    expect(resolveSessionCwd(root, '/tmp/cdb033-escapee', () => {}, { create: true })).toBe(abs);
+    expect(fs.existsSync(path.join(path.dirname(abs), 'escapee'))).toBe(false);
+    expect(fs.existsSync('/tmp/cdb033-escapee')).toBe(false);
+  });
+
+  it('leaves an existing repo alone rather than re-initialising it', () => {
+    const existing = path.join(root, 'already');
+    fs.mkdirSync(existing);
+    execFileSync('git', ['-C', existing, 'init', '--quiet']);
+    fs.writeFileSync(path.join(existing, 'keep.txt'), 'x');
+    const headBefore = fs.readFileSync(path.join(existing, '.git', 'HEAD'), 'utf8');
+
+    const out = resolveSessionCwd(root, 'already', () => {}, { create: true });
+    expect(out).toBe(existing);
+    expect(fs.readFileSync(path.join(existing, '.git', 'HEAD'), 'utf8')).toBe(headBefore);
+    expect(fs.existsSync(path.join(existing, 'keep.txt'))).toBe(true);
+  });
+
+  it('still falls back to the root for a missing folder when create is off', () => {
+    // Default behaviour is unchanged — creation is opt-in per request.
+    expect(resolveSessionCwd(root, 'nope')).toBe(path.resolve(root));
+    expect(fs.existsSync(path.join(root, 'nope'))).toBe(false);
   });
 });
