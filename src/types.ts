@@ -530,9 +530,17 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  *      a not-yet-initialized project), live `execution` progress derived from GSD's atomic task
  *      commits, recovery signals (`paused` / `blockers` / `verifyFailed`), and per-phase
  *      pre-flight cost (`planCount` / `needsYou`).
+ * v8 = accepts a per-session working directory (`create-session.cwd`, confined to the workspace
+ *      root), so a session can be rooted in one project inside a multi-project workspace instead
+ *      of always landing on `workspaceFolders[0]`; reports `GsdState.hasGit` so the phone can
+ *      refuse to offer "Start GSD" where GSD would `git init` over existing repos; and reports
+ *      the roadmap's real phase count and a percentage scaled to it, instead of counting only the
+ *      phases that happen to have a `.planning/phases/` directory.
+ *      The phone MUST gate the "Project folder" field on this — a pre-v8 bridge ignores `cwd`
+ *      silently and would open the session at the root without saying so.
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 // --- Nostr event kinds ---
 
