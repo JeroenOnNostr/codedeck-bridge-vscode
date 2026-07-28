@@ -843,6 +843,11 @@ export class SdkSessionManager {
     return this.sessions.get(sessionId)?.history.length ?? 0;
   }
 
+  /** Working directory a session was created in — the project root for GSD lookups. */
+  getSessionCwd(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.cwd;
+  }
+
   getPermissionMode(sessionId: string): PermissionMode | undefined {
     return this.sessions.get(sessionId)?.permissionMode;
   }

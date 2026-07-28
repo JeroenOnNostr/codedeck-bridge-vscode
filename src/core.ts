@@ -17,6 +17,7 @@ import { NostrRelay, NostrRelayEvents } from './nostrRelay';
 import { SdkSessionManager } from './sdkSession';
 import { buildScreenshotEntry } from './screenshotDelivery';
 import * as meshAdmin from './meshAdmin';
+import { getGsdState } from './gsdState';
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, PairedPhone, UploadImageBlossomMessage, UploadImageChunkMessage } from './types';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
@@ -310,6 +311,16 @@ export class BridgeCore {
         if (!usage) { return; }
         this.relay.publishUsage(sessionId, usage).catch(err => {
           log(`[Codedeck] Failed to publish usage: ${err}`);
+        });
+      },
+      onGsdRequest: async (sessionId) => {
+        const cwd = this.sdk.getSessionCwd(sessionId);
+        if (!cwd) { return; }
+        // Always publishes, including `available: false`, so the phone can retire a stale strip
+        // when a session moves off a GSD project (or GSD gets uninstalled mid-session).
+        const gsd = await getGsdState(cwd);
+        this.relay.publishGsdState(sessionId, gsd).catch(err => {
+          log(`[Codedeck] Failed to publish gsd-state: ${err}`);
         });
       },
       onHistoryRequest: async (sessionId, afterSeq, _phonePubkey) => {
