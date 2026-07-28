@@ -42,7 +42,7 @@ export interface NostrRelayEvents {
   onUsageRequest: (sessionId: string) => void;
   onGsdRequest: (sessionId: string) => void;
   onHistoryRequest: (sessionId: string, afterSeq: number | undefined, phonePubkey: string) => void;
-  onCreateSession: (defaultEffort?: string, model?: string, testSession?: boolean) => void;
+  onCreateSession: (defaultEffort?: string, model?: string, testSession?: boolean, cwd?: string) => void;
   onRefreshSessions: () => void;
   onCloseSession: (sessionId: string) => void;
   onInterrupt: (sessionId: string) => void;
@@ -1103,7 +1103,7 @@ export class NostrRelay {
           this.events.onHistoryRequest(msg.sessionId, msg.afterSeq, event.pubkey);
           break;
         case 'create-session':
-          Promise.resolve(this.events.onCreateSession(msg.defaultEffort, msg.model, msg.testSession))
+          Promise.resolve(this.events.onCreateSession(msg.defaultEffort, msg.model, msg.testSession, msg.cwd))
             .catch(err => this.log(`[Codedeck] onCreateSession handler error: ${err}`));
           break;
         case 'refresh-sessions':

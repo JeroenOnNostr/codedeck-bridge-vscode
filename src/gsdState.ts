@@ -65,6 +65,7 @@ function blank(installed: boolean): GsdState {
   return {
     installed,
     available: false,
+    hasGit: false,
     situation: installed ? 'unknown' : 'not-installed',
     summary: '',
     milestone: null,
@@ -130,6 +131,32 @@ export function normalizeCommand(command: string, forceNamespaced?: boolean): st
   const ns = forceNamespaced ?? (namespaced ??= usesNamespacedCommands());
   if (ns) return command;
   return command.replace(/^\/gsd:/, '/gsd-');
+}
+
+/**
+ * Reconcile the two phase counts GSD reports (CD-054).
+ *
+ * `smart-entry`'s `total_phases` counts `.planning/phases/` DIRECTORIES, and only a phase that has
+ * been planned has one. On a 5-phase roadmap with phase 1 planned it returns 1 — and `progress`
+ * returns 100%, because every plan it can see is done. Rendered raw, the strip reads
+ * "Phase 1/1 · 100%" on a project that is one fifth built, i.e. it says *finished*.
+ *
+ * `roadmap_total_phases` is the real count parsed from ROADMAP.md and rides in the same payload,
+ * so prefer it. The percentage carries the same blind spot, so scale it by the fraction of the
+ * roadmap GSD can actually see: a finished phase 1 of 5 becomes 20%, not 100%.
+ *
+ * Before any phase is planned there are zero directories and GSD already falls back to the roadmap,
+ * which is why this only ever misreported once work had started.
+ */
+export function resolvePhaseTotals(input: {
+  roadmapTotal: number | null;
+  diskTotal: number | null;
+  rawPercent: number;
+}): { totalPhases: number | null; percent: number } {
+  const { roadmapTotal, diskTotal, rawPercent } = input;
+  const totalPhases = roadmapTotal ?? diskTotal;
+  const scale = roadmapTotal && diskTotal && roadmapTotal > diskTotal ? diskTotal / roadmapTotal : 1;
+  return { totalPhases, percent: Math.round(rawPercent * scale) };
 }
 
 interface RunResult { ok: boolean; stdout: string; }
@@ -201,9 +228,17 @@ interface SmartEntryOut {
   signals?: {
     /** NOTE: arrives as a NUMBER despite STATE.md quoting it. Coerced at the call site. */
     current_phase?: string | number | null;
+    /**
+     * NOTE: counted from `.planning/phases/` DIRECTORIES, not from ROADMAP.md — only phases that
+     * have been planned have a directory. On a 5-phase roadmap with phase 1 planned this is `1`.
+     * Prefer `roadmap_total_phases`. See CD-054.
+     */
     total_phases?: number | null;
+    /** The real phase count, parsed from ROADMAP.md. Null before a roadmap exists. */
+    roadmap_total_phases?: number | null;
     has_planning?: boolean;
     has_roadmap?: boolean;
+    has_git?: boolean;
     paused?: boolean;
     blockers?: unknown[];
     verify_failed?: boolean;
@@ -312,6 +347,7 @@ async function computeGsdState(cwd: string): Promise<GsdState> {
   if (entry.signals?.has_planning !== true) {
     return {
       ...blank(true),
+      hasGit: entry.signals?.has_git === true,
       situation: entry.situation || 'no-project',
       summary: entry.summary || '',
       actions: toActions(entry),
@@ -370,16 +406,27 @@ async function computeGsdState(cwd: string): Promise<GsdState> {
   const execution = buildExecution(currentPhase, planIndex, await gitSubjects(cwd), entry.situation);
 
   const signals = entry.signals ?? {};
+
+  const { totalPhases, percent } = resolvePhaseTotals({
+    roadmapTotal: signals.roadmap_total_phases ?? null,
+    // `|| null` on the last fallback: a phase-less project should read "unknown", not "0 phases".
+    diskTotal: signals.total_phases ?? manager?.phase_count ?? (phases.length || null),
+    rawPercent: typeof progress?.percent === 'number' ? progress.percent : 0,
+  });
+
   return {
     installed: true,
     available: true,
+    hasGit: signals.has_git === true,
     situation: entry.situation || 'unknown',
+    // Deliberately NOT `entry.summary` for the strip's collapsed line — GSD bakes the same wrong
+    // phase count into that string ("Phase 1 of 1 · executing"). The phone re-derives it from
+    // `totalPhases`/`percent` in stripSummary().
     summary: entry.summary || '',
     milestone: milestoneLabel(progress),
     currentPhase,
-    // `|| null` on the last fallback: a phase-less project should read "unknown", not "0 phases".
-    totalPhases: signals.total_phases ?? manager?.phase_count ?? (phases.length || null),
-    percent: typeof progress?.percent === 'number' ? progress.percent : 0,
+    totalPhases,
+    percent,
     phases,
     actions: toActions(entry),
     recommended: entry.recommended ?? null,

@@ -160,6 +160,16 @@ export interface CreateSessionMessage {
    * to this session. Only test sessions get device control; normal coding sessions do not.
    */
   testSession?: boolean;
+  /**
+   * Working directory for the new session. Absolute, or relative to the workspace root.
+   *
+   * Omitted (the default) means the workspace root, i.e. the pre-CDB-033 behaviour. Supplying it
+   * is what lets a session be rooted in one project inside a multi-project workspace — without it
+   * every session lands on `workspaceFolders[0]`, so anything that reads the session's cwd (GSD
+   * above all) can only ever see the root. Validated bridge-side: it must resolve to a directory
+   * inside the workspace root, or the request falls back to the root.
+   */
+  cwd?: string;
 }
 
 // --- Refresh sessions (phone → bridge) ---
@@ -387,6 +397,13 @@ export interface GsdState {
   installed: boolean;
   /** This project has a `.planning/` directory, i.e. there is real workflow state to show. */
   available: boolean;
+  /**
+   * This directory is inside a git worktree. GSD's `new-project` runs `git init` when it isn't
+   * (workflows/new-project.md §1), so offering "Start GSD" on a non-repo can create a repo on top
+   * of whatever is there — at a multi-project root, on top of every nested repo. The Start button
+   * is gated on this (CD-056).
+   */
+  hasGit: boolean;
   /** no-project | needs-first-phase | planning | executing | verify-pending | … */
   situation: string;
   summary: string;

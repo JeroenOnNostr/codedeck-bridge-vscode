@@ -18,6 +18,46 @@ import { SdkSessionManager } from './sdkSession';
 import { buildScreenshotEntry } from './screenshotDelivery';
 import * as meshAdmin from './meshAdmin';
 import { getGsdState } from './gsdState';
+
+/**
+ * Resolve the working directory for a new session (CDB-033).
+ *
+ * Before this, every session ran at `workspaceFolders[0]`. In a workspace holding many sibling
+ * repos that meant anything reading the session's cwd — GSD above all — could only ever see the
+ * multi-project root, never an actual project.
+ *
+ * The phone may now ask for a subdirectory, and that is untrusted input, so it is confined to the
+ * workspace root: the resolved path must be the root or beneath it, and must already exist as a
+ * directory. Anything else logs and falls back to the root rather than failing the request — a
+ * stale bookmark on the phone should not make sessions un-creatable.
+ */
+export function resolveSessionCwd(
+  root: string,
+  requested: string | undefined,
+  log: (m: string) => void = () => {},
+): string {
+  const rootReal = path.resolve(root);
+  if (!requested) return rootReal;
+
+  const resolved = path.resolve(rootReal, requested);
+  // Compare on path segments, never string prefix: `/ws/app-2` must not count as inside `/ws/app`.
+  const rel = path.relative(rootReal, resolved);
+  const inside = resolved === rootReal || (rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel));
+  if (!inside) {
+    log(`[Codedeck] Rejected session cwd outside the workspace: ${requested} → using ${rootReal}`);
+    return rootReal;
+  }
+  try {
+    if (!fs.statSync(resolved).isDirectory()) {
+      log(`[Codedeck] Session cwd is not a directory: ${resolved} → using ${rootReal}`);
+      return rootReal;
+    }
+  } catch {
+    log(`[Codedeck] Session cwd does not exist: ${resolved} → using ${rootReal}`);
+    return rootReal;
+  }
+  return resolved;
+}
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, PairedPhone, UploadImageBlossomMessage, UploadImageChunkMessage } from './types';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
@@ -168,13 +208,14 @@ export class BridgeCore {
           });
         }
       },
-      onCreateSession: async (defaultEffort?, model?, testSession?) => {
+      onCreateSession: async (defaultEffort?, model?, testSession?, requestedCwd?) => {
         const sessionId = crypto.randomUUID();
         const effort = defaultEffort as EffortLevel | undefined;
-        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}${testSession ? ' [test session: device tools enabled]' : ''}`);
+        log(`[Codedeck] Create session request — spawning SDK session ${sessionId}${effort ? ` (effort: ${effort})` : ''}${model ? ` (model: ${model})` : ''}${testSession ? ' [test session: device tools enabled]' : ''}${requestedCwd ? ` (cwd: ${requestedCwd})` : ''}`);
 
         try {
-          const cwd = this.workspaceCwd || process.cwd();
+          const root = this.workspaceCwd || process.cwd();
+          const cwd = resolveSessionCwd(root, requestedCwd, log);
           // Apply model + effort at query() construction so 'max'/'xhigh' take effect from the first turn.
           // testSession attaches the on-device adb MCP tools (Phase 2.3).
           this.sdk.createSession(sessionId, cwd, 'plan', model, effort, { testSession: !!testSession });
