@@ -4,7 +4,7 @@ import { execFileSync } from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
 
-import { getGsdState, normalizeCommand, clearGsdCache } from '../gsdState';
+import { getGsdState, normalizeCommand, clearGsdCache, resolvePhaseTotals } from '../gsdState';
 
 /**
  * The value of gsdState.ts IS the gsd-tools CLI contract, so the phase/action assertions run the
@@ -207,5 +207,54 @@ describe.skipIf(!HAS_GSD)('getGsdState — live execution from task commits', ()
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * CD-054 — the strip claimed a 5-phase project was finished.
+ *
+ * `smart-entry` reports two different phase counts and the obvious one is wrong: `total_phases`
+ * counts `.planning/phases/` directories, which only exist for phases that have been PLANNED.
+ * Finish phase 1 of 5 and it says 1, while `progress` says 100% because every plan it can see is
+ * done. The correct count rides alongside as `roadmap_total_phases`.
+ */
+describe('resolvePhaseTotals — CD-054', () => {
+  it('prefers the roadmap count over the on-disk directory count', () => {
+    // The exact shape observed in gsd-testbed after executing phase 1 of a 5-phase roadmap.
+    const r = resolvePhaseTotals({ roadmapTotal: 5, diskTotal: 1, rawPercent: 100 });
+    expect(r.totalPhases).toBe(5);
+  });
+
+  it('scales the percentage to the whole roadmap, not just the planned phases', () => {
+    // The headline bug: this used to be 100 — "done" — one fifth of the way through.
+    expect(resolvePhaseTotals({ roadmapTotal: 5, diskTotal: 1, rawPercent: 100 }).percent).toBe(20);
+    expect(resolvePhaseTotals({ roadmapTotal: 4, diskTotal: 2, rawPercent: 50 }).percent).toBe(25);
+    expect(resolvePhaseTotals({ roadmapTotal: 3, diskTotal: 1, rawPercent: 100 }).percent).toBe(33);
+  });
+
+  it('leaves the percentage alone once every phase has been planned', () => {
+    // diskTotal === roadmapTotal: GSD can see the whole roadmap, so its own number is already right
+    // and 100% genuinely means finished.
+    expect(resolvePhaseTotals({ roadmapTotal: 5, diskTotal: 5, rawPercent: 100 }).percent).toBe(100);
+    expect(resolvePhaseTotals({ roadmapTotal: 5, diskTotal: 5, rawPercent: 40 }).percent).toBe(40);
+  });
+
+  it('never scales up when more phases exist on disk than the roadmap lists', () => {
+    // An inserted decimal phase (2.1) can put more dirs on disk than the roadmap enumerates.
+    // Guard against inflating a percentage past its real value.
+    const r = resolvePhaseTotals({ roadmapTotal: 3, diskTotal: 5, rawPercent: 60 });
+    expect(r.percent).toBe(60);
+    expect(r.totalPhases).toBe(3);
+  });
+
+  it('falls back to the disk count before a roadmap exists', () => {
+    // roadmap_total_phases is null until ROADMAP.md is written — must not blank the readout.
+    const r = resolvePhaseTotals({ roadmapTotal: null, diskTotal: 2, rawPercent: 50 });
+    expect(r.totalPhases).toBe(2);
+    expect(r.percent).toBe(50);
+  });
+
+  it('reports an unknown total rather than "0 phases" when neither count is available', () => {
+    expect(resolvePhaseTotals({ roadmapTotal: null, diskTotal: null, rawPercent: 0 }).totalPhases).toBeNull();
   });
 });

@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { touchesSecretPath, isBenignPlanDirWrite } from '../sdkSession';
 import { redactSecrets } from '../deviceActions';
+import { resolveSessionCwd } from '../core';
 
 const PLANS_DIR = path.join(
   process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), '.claude'),
@@ -106,5 +108,62 @@ describe('redactSecrets — logcat/output scrubbing', () => {
   it('leaves benign log lines intact', () => {
     const line = 'D/MainActivity: onCreate took 42ms';
     expect(redactSecrets(line)).toBe(line);
+  });
+});
+
+/**
+ * CDB-033 — the phone may now choose a session's working directory, which makes it untrusted
+ * input reaching a subprocess cwd. It must stay inside the workspace root.
+ */
+describe('resolveSessionCwd — session cwd confinement', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb033-'));
+    fs.mkdirSync(path.join(root, 'app'));
+    fs.mkdirSync(path.join(root, 'app-2'));
+    fs.writeFileSync(path.join(root, 'notes.md'), 'x');
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('defaults to the workspace root when nothing is requested', () => {
+    // The pre-CDB-033 behaviour, preserved exactly for older phones that never send the field.
+    expect(resolveSessionCwd(root, undefined)).toBe(path.resolve(root));
+  });
+
+  it('accepts a real subdirectory', () => {
+    expect(resolveSessionCwd(root, 'app')).toBe(path.join(path.resolve(root), 'app'));
+  });
+
+  it('rejects traversal out of the workspace', () => {
+    const abs = path.resolve(root);
+    expect(resolveSessionCwd(root, '../..')).toBe(abs);
+    expect(resolveSessionCwd(root, 'app/../../..')).toBe(abs);
+    expect(resolveSessionCwd(root, '/etc')).toBe(abs);
+  });
+
+  it('does not treat a sibling with a shared name prefix as inside', () => {
+    // The reason containment is checked on path segments and not with startsWith: a naive
+    // prefix test would accept an escape into any sibling whose name extends the root's.
+    const sibling = `${path.resolve(root)}-evil`;
+    fs.mkdirSync(sibling, { recursive: true });
+    try {
+      expect(resolveSessionCwd(root, sibling)).toBe(path.resolve(root));
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the root for a path that does not exist or is a file', () => {
+    // A stale bookmark on the phone must not make sessions un-creatable.
+    const abs = path.resolve(root);
+    expect(resolveSessionCwd(root, 'nope')).toBe(abs);
+    expect(resolveSessionCwd(root, 'notes.md')).toBe(abs);
+  });
+
+  it('allows the root itself', () => {
+    expect(resolveSessionCwd(root, '.')).toBe(path.resolve(root));
   });
 });
