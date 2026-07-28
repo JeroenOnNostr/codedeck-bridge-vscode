@@ -2,6 +2,37 @@
 
 ## GSD integration
 
+- [ ] **CDB-034: the session-meta request rewrites a slash command's arguments** — ✅ code + tests
+  done, **device-verify owed**. `sendInput()` appends
+  `<!-- emit-session-meta: … -->` to a session's first message to get a topic/project label back.
+  Claude Code treats everything after a slash command's name as that command's `$ARGUMENTS`, so on a
+  session opened with one — which is now the normal case, since CodeDeck's GSD strip sends a command
+  for every tap and "New GSD project" opens the session with `/gsd-new-project` — the command is
+  quietly asked to do something else. `/gsd-execute-phase 2` arrives as phase
+  `"2\n\n<!-- emit-session-meta: … -->"`. Fixed by `isSlashCommand()`: skip the append for
+  commands and track the outstanding ask in a new `metaRequested` flag rather than in `title`, so a
+  session that opened with a command still gets labelled on its first ordinary message. 7 tests.
+
+  <details><summary>Device-verification run-sheet</summary>
+
+  **Preconditions.** Laptop running a bridge built from this commit (`npm run package` →
+  `codedeck-bridge-2026.7.31.vsix` → install → **Reload Window**; the reload is what activates it).
+  Phone on CodeDeck 2026.7.31+. A GSD project with a roadmap of ≥2 phases — `gsd-testbed` is one.
+
+  **Steps.**
+  1. From the phone, create a session with **Project folder** = `gsd-testbed`.
+  2. As the session's **very first** input, tap the strip's phase row for phase 2 (or type
+     `/gsd-execute-phase 2`).
+  3. Watch the laptop-side stream / `.planning/` for which phase GSD acts on.
+
+  **Pass oracle.** GSD executes **phase 2**. **Pre-fix, the first-message path appended the
+  metadata comment to the arguments**, so the command's `$ARGUMENTS` was `2` followed by two
+  newlines and an HTML comment — GSD either mis-parsed the phase or dragged the comment into its
+  reasoning. Also confirm the session card still acquires a topic/project label after the *second*
+  (ordinary, non-slash) message — that is the half of the fix that must not regress. If the card
+  stays titled `/gsd-execute-phase 2` forever, `metaRequested` is not being cleared.
+  </details>
+
 - [x] **CDB-033: a session can only ever be rooted at `workspaceFolders[0]`** — ✅ code + tests done,
   **device-verify owed**. Fixed in `46926e4` (+ phone `3f29615`): `create-session` takes an optional
   `cwd`, and `resolveSessionCwd()` confines it to the workspace root — containment is checked on
