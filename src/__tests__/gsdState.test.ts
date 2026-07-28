@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
+import { execFileSync } from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -44,21 +45,32 @@ describe('getGsdState — degradation', () => {
   it('reports unavailable for an empty cwd', async () => {
     const s = await getGsdState('');
     expect(s.available).toBe(false);
+    expect(s.installed).toBe(false);
   });
 
-  it('reports unavailable when gsd-tools is not installed', async () => {
+  it('reports NOT installed when gsd-tools is missing — distinct from "not set up yet"', async () => {
+    // The phone uses this distinction to decide whether a Start button can do anything.
     process.env.CODEDECK_GSD_TOOLS_PATH = path.join(os.tmpdir(), 'definitely-not-gsd-tools.cjs');
     clearGsdCache();
     const s = await getGsdState(FIXTURE);
+    expect(s.installed).toBe(false);
     expect(s.available).toBe(false);
+    expect(s.actions).toEqual([]);
     expect(s.phases).toEqual([]);
   });
 
-  it.skipIf(!HAS_GSD)('reports unavailable for a directory with no .planning/', async () => {
+  it.skipIf(!HAS_GSD)('reports installed-but-unavailable for a directory with no .planning/', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codedeck-nogsd-'));
     try {
       const s = await getGsdState(dir);
       expect(s.available).toBe(false);
+      expect(s.installed).toBe(true);          // ← what makes a Start button meaningful
+      expect(s.situation).toBe('no-project');
+      // GSD's bootstrap actions must survive the gate, or there is nothing to start.
+      const ids = s.actions.map(a => a.id);
+      expect(ids).toContain('new-project');
+      expect(ids).toContain('map-codebase');
+      for (const a of s.actions) expect(a.command.startsWith('/gsd-')).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -69,8 +81,8 @@ describe.skipIf(!HAS_GSD)('getGsdState — against the real gsd-tools + fixture'
   it('resolves the fixture project', async () => {
     const s = await getGsdState(FIXTURE);
     expect(s.available).toBe(true);
-    // Fixture: 2 plans, 1 summary → 50%.
-    expect(s.percent).toBe(50);
+    // Fixture: 3 plans (01-01, 02-01, 02-02), 1 summary → 33%.
+    expect(s.percent).toBe(33);
     expect(s.phases).toHaveLength(3);
   });
 
@@ -121,5 +133,79 @@ describe.skipIf(!HAS_GSD)('getGsdState — against the real gsd-tools + fixture'
     const a = await getGsdState(FIXTURE);
     const b = await getGsdState(FIXTURE);
     expect(b).toBe(a);   // same object reference → served from cache
+  });
+
+  it('reports pre-flight cost for the phase it wants executed', async () => {
+    const s = await getGsdState(FIXTURE);
+    const phase2 = s.phases.find(p => p.number === '2');
+    // Fixture phase 2 has two plans, one with `autonomous: false`.
+    expect(phase2?.planCount).toBe(2);
+    expect(phase2?.needsYou).toBe(1);
+  });
+
+  it('leaves pre-flight null for phases with nothing to execute', async () => {
+    const s = await getGsdState(FIXTURE);
+    // Phase 1 is complete — spending an exec on it would tell the user nothing.
+    expect(s.phases.find(p => p.number === '1')?.needsYou).toBeNull();
+  });
+
+  it('carries the recovery signals', async () => {
+    const s = await getGsdState(FIXTURE);
+    expect(s.paused).toBe(false);
+    expect(s.verifyFailed).toBe(false);
+    expect(Array.isArray(s.blockers)).toBe(true);
+  });
+});
+
+describe.skipIf(!HAS_GSD)('getGsdState — live execution from task commits', () => {
+  let repo: string;
+
+  beforeAll(() => {
+    repo = execFileSync(path.join(__dirname, 'fixtures', 'make-git-fixture.sh'), { encoding: 'utf8' }).trim();
+  });
+  afterAll(() => { if (repo) fs.rmSync(repo, { recursive: true, force: true }); });
+
+  it('reconstructs plan and task progress that phase status alone cannot show', async () => {
+    clearGsdCache();
+    const s = await getGsdState(repo);
+    const ex = s.execution;
+    expect(ex).not.toBeNull();
+    expect(ex!.phase).toBe('2');
+    expect(ex!.plansTotal).toBe(2);
+    expect(ex!.plansDone).toBe(0);
+    expect(ex!.currentPlan).toBe('02-01');
+    // Two `*(02-01):` commits in the fixture; the third commit is unrelated and must not count.
+    expect(ex!.tasksDone).toBe(2);
+    expect(ex!.tasksTotal).toBe(3);           // <task> tags declared by 02-01-PLAN.md
+    expect(ex!.lastTask).toBe('cover the build step');
+  });
+
+  it('ignores commits that are not GSD task commits', async () => {
+    clearGsdCache();
+    const s = await getGsdState(repo);
+    expect(s.execution!.lastTask).not.toContain('unrelated');
+  });
+
+  it('reports task 0/N while executing with nothing committed yet', async () => {
+    // The committed fixture's STATE.md says `status: executing` and it has no git history — that
+    // is a real state (phase started, first task not yet committed) and 0/3 is the honest readout.
+    clearGsdCache();
+    const s = await getGsdState(FIXTURE);
+    expect(s.execution?.tasksDone).toBe(0);
+    expect(s.execution?.lastTask).toBeNull();
+  });
+
+  it('returns no execution block when the phase is not being executed', async () => {
+    // Inventing "task 0/N" for a phase that has not started is worse than saying nothing.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codedeck-gsd-idle-'));
+    try {
+      fs.cpSync(path.join(FIXTURE, '.planning'), path.join(dir, '.planning'), { recursive: true });
+      const statePath = path.join(dir, '.planning', 'STATE.md');
+      fs.writeFileSync(statePath, fs.readFileSync(statePath, 'utf8').replace('status: executing', 'status: planning'));
+      clearGsdCache();
+      expect((await getGsdState(dir)).execution).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

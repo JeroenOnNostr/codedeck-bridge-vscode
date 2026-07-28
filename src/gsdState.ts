@@ -14,9 +14,21 @@
  *   3. `progress`            — percentage/milestone, and the fallback phase list when (2) is
  *                              unavailable. Never throws.
  *
+ * Two more, fetched only when they can say something:
+ *
+ *   4. `query phase-plan-index N` — per-plan `autonomous` / `task_count` / `has_summary`. Drives
+ *                              pre-flight cost ("3 plans, 1 needs you") and the live task
+ *                              denominator. Capped at MAX_PREFLIGHT_PHASES execs.
+ *   5. `git log`               — GSD commits every task atomically as `type(phase-plan): desc`,
+ *                              and during a parallel wave that log is the ONLY thing that moves
+ *                              (per-plan STATE.md writes are skipped inside worktrees and batched
+ *                              after the merge). Without it the strip is frozen for the entire
+ *                              longest activity in the workflow.
+ *
  * Everything is best-effort: a missing gsd-tools, a non-GSD directory, a timeout, or malformed
- * JSON all degrade to `{ available: false }`, which the phone renders as nothing at all. A
- * broken GSD install must never break a normal Codedeck session.
+ * JSON all degrade to a blank snapshot. `installed` is reported separately from `available` so a
+ * session the user opted into can tell "GSD isn't here" from "this project isn't set up yet" and
+ * offer a Start button for the latter. A broken GSD install must never break a normal session.
  *
  * Two gotchas encoded here, both verified against a live 1.8.0 install:
  *   - gsd-tools writes warnings (e.g. "unknown config key(s)") to STDERR. We parse stdout only;
@@ -43,18 +55,33 @@ const CACHE_TTL_MS = 2_000;
 /** A runaway roadmap must not bloat a single relay event. */
 const MAX_PHASES = 40;
 
-const UNAVAILABLE: GsdState = {
-  available: false,
-  situation: 'unknown',
-  summary: '',
-  milestone: null,
-  currentPhase: null,
-  totalPhases: null,
-  percent: 0,
-  phases: [],
-  actions: [],
-  recommended: null,
-};
+/** Cap the pre-flight fan-out: one phase-plan-index exec per actionable phase, at most this many. */
+const MAX_PREFLIGHT_PHASES = 3;
+
+/** How far back to read task commits. A phase's worth of tasks is well inside this. */
+const TASK_COMMIT_SCAN = 80;
+
+function blank(installed: boolean): GsdState {
+  return {
+    installed,
+    available: false,
+    situation: installed ? 'unknown' : 'not-installed',
+    summary: '',
+    milestone: null,
+    currentPhase: null,
+    totalPhases: null,
+    percent: 0,
+    phases: [],
+    actions: [],
+    recommended: null,
+    paused: false,
+    blockers: [],
+    verifyFailed: false,
+    execution: null,
+  };
+}
+
+const NOT_INSTALLED: GsdState = blank(false);
 
 /**
  * Locate `gsd-tools.cjs`. GSD 1.8.0 is laid down by an ephemeral `npx`, so there is NO
@@ -119,6 +146,42 @@ function runGsd(tools: string, args: string[], cwd: string): Promise<RunResult> 
   });
 }
 
+/** Read recent commit subjects. Best-effort: no git, no repo, or a git error → empty. */
+function gitSubjects(cwd: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['-C', cwd, 'log', '--no-merges', `-n${TASK_COMMIT_SCAN}`, '--pretty=format:%s'],
+      { timeout: GSD_TIMEOUT_MS, maxBuffer: GSD_MAX_BUFFER, encoding: 'utf8' },
+      (err, stdout) => resolve(err ? [] : String(stdout ?? '').split('\n').filter(Boolean)),
+    );
+  });
+}
+
+/**
+ * GSD's task-commit convention: `{type}({phase}-{plan}): {description}`, e.g.
+ * `feat(04-01): implement payment session creation`. Phase may be decimal (`2.1`) for inserted
+ * phases. Anything else in the log is ordinary work and ignored.
+ */
+const TASK_COMMIT_RE = /^\w+\((\d+(?:\.\d+)*)-(\d+)\):\s*(.+)$/;
+
+interface TaskCommit { phase: string; plan: string; desc: string }
+
+function parseTaskCommits(subjects: string[]): TaskCommit[] {
+  const out: TaskCommit[] = [];
+  for (const s of subjects) {
+    const m = TASK_COMMIT_RE.exec(s);
+    if (m) out.push({ phase: m[1], plan: m[2], desc: m[3] });
+  }
+  return out;   // newest-first, mirroring git log order
+}
+
+/** Phase ids appear as both '2' and '02' across GSD's own outputs — compare numerically. */
+function samePhase(a: string, b: string): boolean {
+  const na = parseFloat(a), nb = parseFloat(b);
+  return Number.isFinite(na) && Number.isFinite(nb) ? na === nb : a === b;
+}
+
 async function queryJson<T>(tools: string, args: string[], cwd: string): Promise<T | null> {
   const r = await runGsd(tools, args, cwd);
   if (!r.ok || !r.stdout) return null;
@@ -136,12 +199,22 @@ interface SmartEntryOut {
   recommended?: string;
   summary?: string;
   signals?: {
-    current_phase?: string | null;
+    /** NOTE: arrives as a NUMBER despite STATE.md quoting it. Coerced at the call site. */
+    current_phase?: string | number | null;
     total_phases?: number | null;
     has_planning?: boolean;
     has_roadmap?: boolean;
+    paused?: boolean;
+    blockers?: unknown[];
+    verify_failed?: boolean;
   };
   actions?: Array<{ id?: string; label?: string; command?: string; recommended?: boolean }>;
+}
+
+interface PlanIndexOut {
+  plans?: Array<{ id?: string; autonomous?: boolean; task_count?: number; has_summary?: boolean }>;
+  incomplete?: string[];
+  has_checkpoints?: boolean;
 }
 
 interface ManagerOut {
@@ -199,11 +272,12 @@ export function clearGsdCache(): void {
 
 /**
  * Resolve the GSD stage snapshot for a session's working directory.
- * `available: false` means "render nothing" — not a GSD project, or GSD isn't installed.
+ * `available: false` means there's no `.planning/` here; `installed` still says whether GSD
+ * exists on this machine, which is what lets an opted-in session offer a Start button.
  * `--cwd` makes gsd-tools walk up for the project root, so a subdirectory cwd works fine.
  */
 export async function getGsdState(cwd: string): Promise<GsdState> {
-  if (!cwd) return UNAVAILABLE;
+  if (!cwd) return NOT_INSTALLED;
 
   const cached = cache.get(cwd);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
@@ -213,13 +287,37 @@ export async function getGsdState(cwd: string): Promise<GsdState> {
   return value;
 }
 
+function toActions(entry: SmartEntryOut): GsdAction[] {
+  return (entry.actions ?? [])
+    .filter(a => typeof a.command === 'string' && typeof a.id === 'string')
+    .map(a => ({
+      id: a.id as string,
+      label: a.label || (a.id as string),
+      command: normalizeCommand(a.command as string),
+      recommended: a.recommended === true,
+    }));
+}
+
 async function computeGsdState(cwd: string): Promise<GsdState> {
   const tools = gsdTools();
-  if (!tools) return UNAVAILABLE;
+  if (!tools) return NOT_INSTALLED;
 
   // 1. The gate. Never throws, so a null here means something is genuinely wrong.
   const entry = await queryJson<SmartEntryOut>(tools, ['smart-entry', '--json'], cwd);
-  if (!entry || entry.signals?.has_planning !== true) return UNAVAILABLE;
+  if (!entry) return blank(true);
+
+  // Not a GSD project *yet*. Still return `installed: true` plus the actions GSD offers for the
+  // no-project situation (new-project / map-codebase), so a session the user has explicitly
+  // opted in can show a Start button. Sessions that haven't opted in render nothing regardless.
+  if (entry.signals?.has_planning !== true) {
+    return {
+      ...blank(true),
+      situation: entry.situation || 'no-project',
+      summary: entry.summary || '',
+      actions: toActions(entry),
+      recommended: entry.recommended ?? null,
+    };
+  }
 
   // 2 + 3. init.manager is guarded on has_roadmap AND still try/caught via queryJson's null,
   // because it also throws when STATE.md is missing — a real state for a half-initialized project.
@@ -234,27 +332,108 @@ async function computeGsdState(cwd: string): Promise<GsdState> {
     ? phasesFromManager(manager)
     : phasesFromProgress(progress);
 
-  const actions: GsdAction[] = (entry.actions ?? [])
-    .filter(a => typeof a.command === 'string' && typeof a.id === 'string')
-    .map(a => ({
-      id: a.id as string,
-      label: a.label || (a.id as string),
-      command: normalizeCommand(a.command as string),
-      recommended: a.recommended === true,
-    }));
+  // STATE.md's `current_phase: '2'` comes back through smart-entry as a NUMBER, while every phase
+  // id from init.manager/progress is a string. Coerce here or the phone's
+  // `currentPhase === phase.number` check is always false and the current-phase highlight silently
+  // never fires.
+  const rawPhase = entry.signals?.current_phase;
+  const currentPhase = rawPhase === null || rawPhase === undefined ? null : String(rawPhase);
 
+  // 4. Pre-flight + live progress both need phase-plan-index, so fetch each phase once and share.
+  // Only phases GSD wants *executed* are worth the exec: discuss/plan are interactive by nature,
+  // so "needs you" tells you nothing there.
+  const wanted: string[] = [];
+  for (const p of phases) {
+    if (p.action === 'execute' && wanted.length < MAX_PREFLIGHT_PHASES) wanted.push(p.number);
+  }
+  if (currentPhase && !wanted.some(w => samePhase(w, currentPhase))) {
+    wanted.unshift(currentPhase);
+    wanted.length = Math.min(wanted.length, MAX_PREFLIGHT_PHASES);
+  }
+
+  const indexEntries = await Promise.all(
+    wanted.map(async (n) => [n, await queryJson<PlanIndexOut>(tools, ['query', 'phase-plan-index', n], cwd)] as const),
+  );
+  const planIndex = new Map(indexEntries.filter(([, v]) => v).map(([n, v]) => [n, v as PlanIndexOut]));
+
+  for (const p of phases) {
+    const idx = planIndex.get(p.number);
+    if (!idx?.plans) continue;
+    p.planCount = idx.plans.length;
+    // "Needs you" == plans with `autonomous: false` in their frontmatter. Note GSD's own
+    // phase-level `has_checkpoints` is derived from exactly this (phase.cjs:577-581) — it is NOT
+    // a separate signal about `<task type="checkpoint:…">` tags, so counting plans is strictly
+    // more informative and there is nothing extra to fall back to.
+    p.needsYou = idx.plans.filter(pl => pl.autonomous === false).length;
+  }
+
+  const execution = buildExecution(currentPhase, planIndex, await gitSubjects(cwd), entry.situation);
+
+  const signals = entry.signals ?? {};
   return {
+    installed: true,
     available: true,
     situation: entry.situation || 'unknown',
     summary: entry.summary || '',
     milestone: milestoneLabel(progress),
-    currentPhase: entry.signals?.current_phase ?? null,
+    currentPhase,
     // `|| null` on the last fallback: a phase-less project should read "unknown", not "0 phases".
-    totalPhases: entry.signals?.total_phases ?? manager?.phase_count ?? (phases.length || null),
+    totalPhases: signals.total_phases ?? manager?.phase_count ?? (phases.length || null),
     percent: typeof progress?.percent === 'number' ? progress.percent : 0,
     phases,
-    actions,
+    actions: toActions(entry),
     recommended: entry.recommended ?? null,
+    paused: signals.paused === true,
+    blockers: (signals.blockers ?? []).map(b => (typeof b === 'string' ? b : JSON.stringify(b))).slice(0, 5),
+    verifyFailed: signals.verify_failed === true,
+    execution,
+  };
+}
+
+/**
+ * Reconstruct live progress inside the phase being executed.
+ *
+ * plansDone comes from `has_summary` (a SUMMARY.md is GSD's own definition of a finished plan);
+ * task counts come from the atomic commits, which are the only thing that moves during a
+ * parallel wave. Returns null unless there is something real to show — a strip that invents
+ * progress is worse than one that admits it doesn't know.
+ */
+function buildExecution(
+  currentPhase: string | null,
+  planIndex: Map<string, PlanIndexOut>,
+  subjects: string[],
+  situation: string | undefined,
+): GsdState['execution'] {
+  if (!currentPhase) return null;
+
+  let idx: PlanIndexOut | undefined;
+  for (const [num, v] of planIndex) { if (samePhase(num, currentPhase)) { idx = v; break; } }
+  if (!idx?.plans?.length) return null;
+
+  const commits = parseTaskCommits(subjects).filter(c => samePhase(c.phase, currentPhase));
+  // Nothing committed and not executing → the phase hasn't started; don't fake a 0/N readout.
+  if (commits.length === 0 && situation !== 'executing') return null;
+
+  const plansTotal = idx.plans.length;
+  const plansDone = idx.plans.filter(p => p.has_summary === true).length;
+
+  // The in-flight plan is the first incomplete one; fall back to whatever last committed.
+  const currentPlanId = idx.incomplete?.[0] ?? (commits[0] ? `${currentPhase}-${commits[0].plan}` : null);
+  const planSuffix = currentPlanId ? currentPlanId.split('-').pop() ?? null : null;
+
+  const planCommits = planSuffix ? commits.filter(c => c.plan === planSuffix) : [];
+  const declared = currentPlanId
+    ? idx.plans.find(p => p.id === currentPlanId)?.task_count ?? null
+    : null;
+
+  return {
+    phase: currentPhase,
+    plansTotal,
+    plansDone,
+    currentPlan: currentPlanId,
+    tasksDone: planCommits.length,
+    tasksTotal: declared && declared > 0 ? declared : null,
+    lastTask: commits[0]?.desc ?? null,
   };
 }
 
@@ -276,6 +455,8 @@ function phasesFromManager(manager: ManagerOut): GsdPhase[] {
       recentlyTouched: p.is_active === true,
       action: rec?.action ?? null,
       command: rec?.command ?? null,
+      planCount: null,
+      needsYou: null,
     };
   });
 }
@@ -290,5 +471,7 @@ function phasesFromProgress(progress: ProgressOut | null): GsdPhase[] {
     recentlyTouched: false,
     action: null,
     command: null,
+    planCount: null,
+    needsYou: null,
   }));
 }
