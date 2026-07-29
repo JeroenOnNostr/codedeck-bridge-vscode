@@ -89,6 +89,97 @@ export function resolveSessionCwd(
   }
   return resolved;
 }
+
+/** Directories that are never a project, only build/dependency noise. */
+const FOLDER_SCAN_SKIP = new Set([
+  'node_modules', 'target', 'dist', 'build', 'out', 'venv', '__pycache__', 'vendor',
+]);
+
+/** Bounds the session-list event: a workspace with a pathological number of folders must not
+ *  bloat an event the phone needs for every session update. */
+const FOLDER_SCAN_LIMIT = 200;
+
+/** Manifests that mark a directory as a project in its own right. Deliberately build-file-ish:
+ *  `src/`, `docs/` and friends carry none of these, a genuine project carries at least one.
+ *  `.git` is NOT here on purpose — see PROJECT_MARKERS. */
+const SELF_CONTAINED_MARKERS = [
+  '.planning', 'package.json', 'Cargo.toml', 'go.mod', 'pyproject.toml',
+  'pubspec.yaml', 'build.gradle', 'build.gradle.kts', 'composer.json', 'Gemfile',
+];
+
+/** What makes a *nested* directory worth listing. A repo nested inside a container counts even
+ *  without a build file — but being a repo says nothing about whether a folder is a container,
+ *  because a monorepo of sub-projects (`nostr-relays`) is a repo too. */
+const PROJECT_MARKERS = ['.git', ...SELF_CONTAINED_MARKERS];
+
+/**
+ * List the workspace's project folders for the phone's "Project folder" picker (CDB-035).
+ *
+ * The phone can't read this filesystem, so before this its picker was fed by the basenames of the
+ * cwds of sessions already running — a one-entry list naming the workspace root, since that is
+ * where every session started. Enumerating here is the only way the picker can name real projects.
+ *
+ * Returns paths relative to `root`, so every entry is directly usable as `create-session.cwd`
+ * (`resolveSessionCwd` resolves nested relative paths and confines them to the root).
+ *
+ * Depth: every immediate child, plus one level deeper — but a nested directory is only listed when
+ * it carries a project marker of its own. That is what separates `nostr-relays/rocket-relay` (a
+ * real project, invisible to a depth-1 scan) from `some-app/src` (internals nobody roots a session
+ * in). Being a git repo is not the test on either side: `nostr-relays` is itself a repo *and* a
+ * container of five projects, and plenty of real projects here have no repo yet.
+ */
+export function listWorkspaceFolders(root: string, log: (m: string) => void = () => {}): string[] {
+  const isProjectDir = (parent: string, entry: fs.Dirent): boolean => {
+    if (entry.name.startsWith('.')) return false;          // dotfiles can't be picked anyway
+    if (FOLDER_SCAN_SKIP.has(entry.name)) return false;
+    if (entry.isDirectory()) return true;
+    // Symlinked projects are common in a workspace; resolve them rather than dropping them.
+    if (!entry.isSymbolicLink()) return false;
+    try {
+      return fs.statSync(path.join(parent, entry.name)).isDirectory();
+    } catch {
+      return false; // broken symlink
+    }
+  };
+
+  const hasAny = (dir: string, markers: string[]): boolean =>
+    markers.some((marker) => fs.existsSync(path.join(dir, marker)));
+
+  try {
+    const rootReal = path.resolve(root);
+    const found: string[] = [];
+
+    for (const entry of fs.readdirSync(rootReal, { withFileTypes: true })) {
+      if (!isProjectDir(rootReal, entry)) continue;
+      const childPath = path.join(rootReal, entry.name);
+      found.push(entry.name);
+
+      // A folder with its own build file IS the project — its subdirectories are modules of it
+      // (`codedeck/src-tauri`), and listing them buries the folder people actually want.
+      if (hasAny(childPath, SELF_CONTAINED_MARKERS)) continue;
+      try {
+        for (const nested of fs.readdirSync(childPath, { withFileTypes: true })) {
+          if (!isProjectDir(childPath, nested)) continue;
+          if (!hasAny(path.join(childPath, nested.name), PROJECT_MARKERS)) continue;
+          found.push(`${entry.name}/${nested.name}`);
+        }
+      } catch {
+        // Unreadable child — the parent is still listed, which is the useful part.
+      }
+    }
+
+    found.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    if (found.length > FOLDER_SCAN_LIMIT) {
+      log(`[Codedeck] Workspace has ${found.length} folders — listing the first ${FOLDER_SCAN_LIMIT}`);
+      return found.slice(0, FOLDER_SCAN_LIMIT);
+    }
+    return found;
+  } catch (e) {
+    // An unreadable workspace must cost the picker its list, never a session.
+    log(`[Codedeck] Could not list workspace folders in ${root}: ${e}`);
+    return [];
+  }
+}
 import type { EffortLevel, OutputEntry, RemoteSessionInfo, PairedPhone, UploadImageBlossomMessage, UploadImageChunkMessage } from './types';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
@@ -127,6 +218,10 @@ export class BridgeCore {
   private imageChunks: Map<string, ImageUploadTracker> = new Map();
   private log: (msg: string) => void;
   private onMeshNotice?: (level: 'info' | 'warn', message: string) => void;
+  // Folder scan cached across session-list publishes (heartbeat is every 60s, and a session change
+  // republishes too). Folders change on the timescale of starting a project, not of a heartbeat.
+  private static readonly FOLDER_CACHE_TTL_MS = 30_000;
+  private folderCache: { folders: string[]; at: number } | null = null;
 
   constructor(config: BridgeCoreConfig, log: (msg: string) => void = console.log) {
     this.workspaceCwd = config.workspaceCwd ?? '';
@@ -247,6 +342,9 @@ export class BridgeCore {
         try {
           const root = this.workspaceCwd || process.cwd();
           const cwd = resolveSessionCwd(root, requestedCwd, log, { create: !!createCwd });
+          // A folder just created from the phone should appear in the picker on the next publish,
+          // not up to a cache TTL later — that gap is exactly when the user goes looking for it.
+          if (createCwd) this.folderCache = null;
           // Apply model + effort at query() construction so 'max'/'xhigh' take effect from the first turn.
           // testSession attaches the on-device adb MCP tools (Phase 2.3).
           this.sdk.createSession(sessionId, cwd, 'plan', model, effort, { testSession: !!testSession });
@@ -460,6 +558,22 @@ export class BridgeCore {
       log,
       config.lastSeenTimestamp,
     );
+
+    // The relay publishes the session list from four different places (heartbeat, session changes,
+    // …), none of which knows about the filesystem — so it pulls the folder list at publish time
+    // instead of every caller having to carry one (CDB-035).
+    this.relay.setFolderProvider(() => this.workspaceFolders());
+  }
+
+  /** Workspace project folders for the phone's picker, memoized (see FOLDER_CACHE_TTL_MS). */
+  private workspaceFolders(): string[] {
+    const now = Date.now();
+    if (this.folderCache && now - this.folderCache.at < BridgeCore.FOLDER_CACHE_TTL_MS) {
+      return this.folderCache.folders;
+    }
+    const folders = listWorkspaceFolders(this.workspaceCwd || process.cwd(), this.log);
+    this.folderCache = { folders, at: now };
+    return folders;
   }
 
   /** Connect to Nostr relays if phones are paired. */
