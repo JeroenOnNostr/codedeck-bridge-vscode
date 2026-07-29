@@ -2,6 +2,44 @@
 
 ## GSD integration
 
+- [ ] **CDB-035: the phone had no way to know what folders the workspace holds** — ✅ code + tests
+  done, **device-verify owed**. CDB-033 let a session be rooted in one project, but the phone can't
+  read this filesystem, so its *Project folder* picker could only offer the folder names of sessions
+  already running — and since every session starts at the workspace root, that was a list of exactly
+  one entry naming the root itself. The picker named everything except a project.
+
+  `listWorkspaceFolders()` (core.ts, beside `resolveSessionCwd`) now enumerates the workspace and
+  the list rides on the session list as `folders` — protocol **v9** — so it is already on the phone
+  when the New Session sheet opens instead of a relay round trip after it. Entries are relative
+  paths, so each one is directly usable as `create-session.cwd`. Depth is one level plus one
+  more *inside a folder that has no build file of its own*: `nostr-relays` is a repo **and** a
+  container of five relay projects, so "descend into non-repos" would have hidden exactly what this
+  exists to surface, while `codedeck/src-tauri` is a module of a project and not a project. Scan is
+  memoized for 30s (the session list republishes every heartbeat) and invalidated when a session
+  creates a folder, capped at 200 entries with a log line rather than a silent truncation, and any
+  failure degrades to no list — never to a failed publish. Real workspace: 45 folders, 816 bytes,
+  10ms. 198 tests (+12).
+
+  <details><summary>Device-verification run-sheet</summary>
+
+  **Preconditions.** Laptop running a bridge built from this commit (`npm run package` → install the
+  `.vsix` → **Reload Window**; the reload is what activates it). Phone on a CodeDeck build carrying
+  CD-059. Paired as usual; the workspace is the 32-project one.
+
+  **Steps.**
+  1. On the phone, tap **+** on the Framework machine to open **New Session**.
+  2. Tap the **Project folder** field.
+  3. Type `nostr` to filter.
+
+  **Pass oracle.** Step 2 lists the real workspace folders (`atna`, `codedeck`, `gantry`, `yenn`, …)
+  and step 3 narrows to `nostr-relays` plus its nested projects `nostr-relays/rocket-relay`,
+  `nostr-relays/impostr-relay` and the other three. **Pre-fix the dropdown had one entry — "VScode
+  workspace for building nostr apps", the workspace root itself.** Then pick `yenn`, start the
+  session, and confirm on the laptop that the session's cwd really is `…/yenn` (bridge output
+  channel logs the created session, and the session card's project reads `yenn`) — the list is only
+  worth anything if the entries it offers are accepted verbatim as `cwd`.
+  </details>
+
 - [ ] **CDB-034: the session-meta request rewrites a slash command's arguments** — ✅ code + tests
   done, **device-verify owed**. `sendInput()` appends
   `<!-- emit-session-meta: … -->` to a session's first message to get a topic/project label back.

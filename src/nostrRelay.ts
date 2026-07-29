@@ -108,6 +108,11 @@ export class NostrRelay {
   private pendingPublishSessions: RemoteSessionInfo[] | null = null;
   private publishDebounceCount = 0;
 
+  // --- Workspace folder listing (CDB-035) ---
+  // Pulled at publish time rather than passed in, because publishSessionList is called from places
+  // that have no filesystem context (the 60s heartbeat, SDK session changes).
+  private folderProvider?: () => string[];
+
   // --- Monotonic timestamp for NIP-33 replaceable events ---
   // Ensures each session list event has a strictly newer created_at than the previous one,
   // preventing "replaced: have newer event" rejections from relays.
@@ -412,6 +417,11 @@ export class NostrRelay {
     }
   }
 
+  /** Supply the workspace's project folders, sent with every session list (CDB-035). */
+  setFolderProvider(provider: () => string[]): void {
+    this.folderProvider = provider;
+  }
+
   /**
    * Publish session list as a NIP-33 replaceable event.
    * Kind 30515 with d-tag = machine name ensures relays keep only the latest.
@@ -496,11 +506,22 @@ export class NostrRelay {
   private async doPublishSessionList(sessions: RemoteSessionInfo[]): Promise<boolean> {
     this.log(`[Codedeck] publishSessionList: ${sessions.length} sessions to ${this.pairedPhones.length} phones via ${this.relays.join(', ')}`);
 
+    // Omitted rather than sent empty when the scan found nothing: the phone treats an absent list
+    // as "this bridge can't tell me" and keeps its own fallback, which is the right read.
+    let folders: string[] | undefined;
+    try {
+      const listed = this.folderProvider?.();
+      folders = listed && listed.length > 0 ? listed : undefined;
+    } catch (err) {
+      this.log(`[Codedeck] Folder listing failed (publishing session list without it): ${err}`);
+    }
+
     const msg: BridgeOutbound = {
       type: 'sessions',
       machine: this.machineName,
       sessions,
       protocolVersion: PROTOCOL_VERSION,
+      ...(folders ? { folders } : {}),
     };
 
     const json = JSON.stringify(msg);

@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { touchesSecretPath, isBenignPlanDirWrite } from '../sdkSession';
 import { redactSecrets } from '../deviceActions';
-import { resolveSessionCwd } from '../core';
+import { resolveSessionCwd, listWorkspaceFolders } from '../core';
 import { execFileSync } from 'child_process';
 
 const PLANS_DIR = path.join(
@@ -224,5 +224,114 @@ describe('resolveSessionCwd — create mode', () => {
     // Default behaviour is unchanged — creation is opt-in per request.
     expect(resolveSessionCwd(root, 'nope')).toBe(path.resolve(root));
     expect(fs.existsSync(path.join(root, 'nope'))).toBe(false);
+  });
+});
+
+/**
+ * CDB-035 — the picker's list. Every entry has to be a path `resolveSessionCwd` will accept, or
+ * the phone offers folders that silently open at the workspace root instead.
+ */
+describe('listWorkspaceFolders — project folders for the phone picker', () => {
+  let root: string;
+
+  const mkdirs = (...rels: string[]) => {
+    for (const rel of rels) fs.mkdirSync(path.join(root, rel), { recursive: true });
+  };
+  const marker = (rel: string, file: string) => fs.writeFileSync(path.join(root, rel, file), '{}');
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb035-'));
+    // A self-contained project with a module inside it, the module carrying its own build file.
+    mkdirs('yenn', 'yenn/src-tauri');
+    marker('yenn', 'package.json');
+    marker('yenn/src-tauri', 'Cargo.toml');
+    mkdirs('Atna');                                    // capital: sorting is case-insensitive
+    marker('Atna', 'build.gradle');
+    // A monorepo container: a repo itself, holding real sub-projects plus a plain notes dir.
+    mkdirs('nostr-relays', 'nostr-relays/.git', 'nostr-relays/rocket-relay',
+      'nostr-relays/rocket-relay/src', 'nostr-relays/impostr-relay/.git', 'nostr-relays/notes');
+    marker('nostr-relays/rocket-relay', 'package.json');
+    mkdirs('.codedeck', 'node_modules/react');
+    fs.writeFileSync(path.join(root, 'agent.md'), 'x');
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('lists the workspace projects, not just the workspace itself', () => {
+    // The whole bug: the phone's picker offered one entry — the workspace root's own name.
+    expect(listWorkspaceFolders(root)).toContain('yenn');
+    expect(listWorkspaceFolders(root)).toContain('Atna');
+  });
+
+  it('descends into a container of projects, even when the container is itself a repo', () => {
+    // `nostr-relays` has a .git of its own, so a "descend only into non-repos" rule would hide
+    // exactly the projects this scan exists to surface.
+    const folders = listWorkspaceFolders(root);
+    expect(folders).toContain('nostr-relays');
+    expect(folders).toContain('nostr-relays/rocket-relay');  // build file
+    expect(folders).toContain('nostr-relays/impostr-relay'); // repo, no build file
+    expect(folders).not.toContain('nostr-relays/notes');     // neither: not a project
+    // One level of descent only — never a grandchild of a container.
+    expect(folders).not.toContain('nostr-relays/rocket-relay/src');
+  });
+
+  it('does not list the modules of a self-contained project', () => {
+    // `yenn` is the folder you root a session in; `yenn/src-tauri` is one of its build targets.
+    const folders = listWorkspaceFolders(root);
+    expect(folders).toContain('yenn');
+    expect(folders).not.toContain('yenn/src-tauri');
+  });
+
+  it('skips dotfiles, build noise and plain files', () => {
+    const folders = listWorkspaceFolders(root);
+    expect(folders).not.toContain('.codedeck');
+    expect(folders).not.toContain('node_modules');
+    expect(folders).not.toContain('node_modules/react');
+    expect(folders).not.toContain('agent.md');
+  });
+
+  it('sorts case-insensitively so the picker reads alphabetically', () => {
+    const folders = listWorkspaceFolders(root);
+    expect(folders).toEqual([...folders].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase())));
+    expect(folders.indexOf('Atna')).toBeLessThan(folders.indexOf('yenn'));
+  });
+
+  it('every entry resolves back to a real directory inside the workspace', () => {
+    // The contract that makes the list usable: what the picker offers, resolveSessionCwd accepts.
+    for (const folder of listWorkspaceFolders(root)) {
+      expect(resolveSessionCwd(root, folder)).toBe(path.join(path.resolve(root), folder));
+    }
+  });
+
+  it('follows a symlinked project and drops a broken one', () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb035-ext-'));
+    try {
+      fs.symlinkSync(external, path.join(root, 'linked-project'));
+      fs.symlinkSync(path.join(root, 'does-not-exist'), path.join(root, 'dangling'));
+      const folders = listWorkspaceFolders(root);
+      expect(folders).toContain('linked-project');
+      expect(folders).not.toContain('dangling');
+    } finally {
+      fs.rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('caps a pathological workspace and says so rather than truncating silently', () => {
+    const big = fs.mkdtempSync(path.join(os.tmpdir(), 'cdb035-big-'));
+    const logged: string[] = [];
+    try {
+      for (let i = 0; i < 250; i++) fs.mkdirSync(path.join(big, `p${String(i).padStart(3, '0')}`));
+      const folders = listWorkspaceFolders(big, (m) => logged.push(m));
+      expect(folders).toHaveLength(200);
+      expect(logged.join('\n')).toMatch(/250 folders/);
+    } finally {
+      fs.rmSync(big, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an empty list for an unreadable workspace instead of throwing', () => {
+    // A failed scan costs the picker its list; it must never break session publishing.
+    expect(listWorkspaceFolders(path.join(root, 'no-such-workspace'))).toEqual([]);
   });
 });

@@ -89,6 +89,34 @@ describe('Protocol types', () => {
       expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(4);
     });
 
+    it('protocol version is at least 9 (workspace folder listing)', () => {
+      expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(9);
+    });
+
+    it('round-trips the workspace folder list on the session list (bridge → phone)', () => {
+      // What the phone's "Project folder" picker reads. Nested entries must survive verbatim —
+      // they are relative cwds, not display names.
+      const msg: SessionListMessage = {
+        type: 'sessions',
+        machine: 'laptop',
+        sessions: [],
+        protocolVersion: PROTOCOL_VERSION,
+        folders: ['atna', 'nostr-relays/rocket-relay', 'yenn'],
+      };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      if (parsed.type === 'sessions') {
+        expect(parsed.folders).toEqual(['atna', 'nostr-relays/rocket-relay', 'yenn']);
+      }
+    });
+
+    it('treats a session list without folders as valid (pre-v9 bridge)', () => {
+      const msg: SessionListMessage = { type: 'sessions', machine: 'laptop', sessions: [] };
+      const parsed: BridgeOutbound = JSON.parse(JSON.stringify(msg));
+      if (parsed.type === 'sessions') {
+        expect(parsed.folders).toBeUndefined();
+      }
+    });
+
     it('round-trips a session list carrying contextWindow (bridge → phone)', () => {
       const msg: SessionListMessage = {
         type: 'sessions',

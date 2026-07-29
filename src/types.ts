@@ -50,6 +50,20 @@ export interface SessionListMessage {
   authStatus?: AuthStatus;
   /** Bridge protocol version (see PROTOCOL_VERSION). Absent → pre-v1 bridge with no model support. */
   protocolVersion?: number;
+  /**
+   * Project folders in the workspace, relative to its root (CDB-035) — e.g. `yenn`,
+   * `nostr-relays/rocket-relay`. Every entry is a valid `create-session.cwd`.
+   *
+   * The phone cannot enumerate the laptop's filesystem, so before this its "Project folder" picker
+   * could only offer the basenames of cwds of sessions already running — which, since every session
+   * used to start at the workspace root, meant a list of exactly one entry: the workspace itself.
+   * The picker was therefore useless for the thing CDB-033 exists to do.
+   *
+   * Rides on the session list rather than a request/response pair so the list is already on the
+   * phone when the New Session sheet opens, instead of a relay round trip after it. Absent on
+   * pre-v9 bridges; the phone falls back to its session-derived list.
+   */
+  folders?: string[];
 }
 
 // --- Output Relay (bridge → phone) ---
@@ -546,9 +560,14 @@ export type BridgeMessage = BridgeOutbound | BridgeInbound;
  *      phases that happen to have a `.planning/phases/` directory.
  *      The phone MUST gate the "Project folder" field on this — a pre-v8 bridge ignores `cwd`
  *      silently and would open the session at the root without saying so.
+ * v9 = lists the workspace's project folders on the session list (`SessionListMessage.folders`), so
+ *      the phone's "Project folder" picker can offer the real folders instead of the basenames of
+ *      running sessions' cwds — which on a workspace where every session starts at the root is a
+ *      one-entry list naming the root itself. Additive: a phone that gets no `folders` keeps the
+ *      old session-derived list, and the field itself still only needs v8.
  * A phone uses this to gate features against older bridges.
  */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 // --- Nostr event kinds ---
 
