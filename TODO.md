@@ -1,5 +1,45 @@
 # TODO — Codedeck Bridge (VSCode Extension)
 
+## Pairing
+
+- [ ] **CDB-039: the pairing link could not be copied, and expired before it could be used** —
+  ✅ code + tests done, **device-verify owed**. Paired with phone-side **CD-061**, which teaches the
+  app to accept a pasted `codedeck://pair?...` link so a phone with no working camera can still
+  pair. That was unusable from this end: the visible URL box deliberately redacts the mesh invite to
+  `&mesh=…` (the secret must not be shoulder-surfable) and there was no copy button, so hand-copying
+  the visible text produced a link with a literal ellipsis where the invite should be.
+
+  Adds a **Copy pairing link** button that copies the *full* URL. The secret reaches the clipboard
+  without ever being rendered — it goes into the webview script, not the DOM — so the redaction
+  property is preserved rather than traded away.
+
+  `PAIRING_WINDOW_MS` goes 180s → 600s. A copied link has to travel through a chat app before anyone
+  can paste it, and 3 minutes routinely expired mid-transit; the failure was silent, because an
+  expired window has already torn down the subscription that would have rejected us. Closing the tab
+  still revokes immediately, so the fast path to shut the window is unchanged.
+
+  `escapeHtml` and the new `embedJsString` move to `webviewHtml.ts`: `pairing.ts` imports `vscode`
+  and so can't load under vitest, which is why neither escaper had ever been tested. 204 tests (+3).
+
+  <details><summary>Device-verification run-sheet</summary>
+
+  **Preconditions.** `npm run build`, then reload the VSCode window (or F5 the extension host) so
+  the new bundle is live. A phone on the CD-061 build, with this machine **unpaired**.
+
+  **Steps.**
+  1. Run **Codedeck: Pair phone**.
+  2. Click **Copy pairing link**, then paste into a scratch buffer.
+  3. Send the link to the phone and paste it into Settings → Remote Machines → Pairing link.
+  4. Leave a second panel open for >3 minutes, then pair a phone from it.
+
+  **Pass oracle.** (a) The on-screen URL box still reads `…&mesh=…` — the secret must **not** appear
+  anywhere in the rendered page (view the webview DOM to confirm); the button label flips to
+  `Copied!` for ~2s. (b) The clipboard holds a real `mesh=` value and a `token=` — **replacing the
+  pre-fix state where the only copyable text carried a literal ellipsis**. (c) Step 3 pairs and this
+  panel flips to "Phone paired!". (d) Step 4 still pairs at 4-9 minutes, where the pre-fix 180s
+  window would have expired silently.
+  </details>
+
 ## Distribution
 
 - [ ] **CDB-038: the extension has never been on the VS Code Marketplace, so installing it means
