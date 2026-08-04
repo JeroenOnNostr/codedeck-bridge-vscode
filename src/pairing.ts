@@ -1,16 +1,18 @@
 /**
- * Phone pairing via QR code.
+ * Phone pairing.
  *
- * Generates a QR code containing the bridge's npub and relay list.
- * The phone scans this QR to establish the encrypted channel.
+ * Generates a QR code containing the bridge's npub and relay list. The phone
+ * either scans it, or — when it has no usable camera — takes the same URL from
+ * the Copy pairing link button and pastes it into Codedeck's settings.
  *
- * QR payload format:
+ * Payload format:
  *   codedeck://pair?npub=<npub>&relays=<comma-separated>&machine=<hostname>
  */
 
 import * as vscode from 'vscode';
 import QRCode from 'qrcode-svg';
 import type { PairingInfo, PairedPhone } from './types';
+import { escapeHtml, embedJsString } from './webviewHtml';
 
 /**
  * Show a webview panel with the pairing QR code.
@@ -169,6 +171,16 @@ function getPairingHtml(pairingUrl: string, displayUrl: string, info: PairingInf
 
     ${info.mesh ? '<p class="info">📡 This QR also bundles a mesh invite, so the phone can self-join your private mesh in one scan.</p>' : ''}
 
+    <div class="section">
+      <h2>No camera on the phone?</h2>
+      <p class="info" style="text-align: left;">
+        Copy the link, send it to the phone, and paste it into
+        <strong>Codedeck → Settings → Remote Machines → Pairing link</strong>.
+        Valid for 10 minutes while this tab stays open.
+      </p>
+      <button id="copyBtn" onclick="copyLink()">Copy pairing link</button>
+    </div>
+
     <p><strong>Pairing URL:</strong></p>
     <div class="url-box">${escapeHtml(displayUrl)}</div>
 
@@ -191,6 +203,39 @@ function getPairingHtml(pairingUrl: string, displayUrl: string, info: PairingInf
 
   <script>
     const vscode = acquireVsCodeApi();
+
+    // The full URL, mesh invite included. It lives only in this script — never in the
+    // DOM — so Copy hands over a working link without the invite secret ever being
+    // rendered where it could be shoulder-surfed. The box above stays redacted.
+    const PAIRING_URL = ${embedJsString(pairingUrl)};
+
+    function copyLink() {
+      const btn = document.getElementById('copyBtn');
+      const done = () => {
+        if (!btn) return;
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = original; }, 2000);
+      };
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(PAIRING_URL).then(done, fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
+
+      // Older webviews reject the async clipboard API outside a trusted context.
+      function fallbackCopy() {
+        const ta = document.createElement('textarea');
+        ta.value = PAIRING_URL;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); done(); } catch (e) { alert('Copy failed — select the QR and rescan instead.'); }
+        document.body.removeChild(ta);
+      }
+    }
 
     // The extension posts { command: 'paired', label } when an auto-pair succeeds.
     window.addEventListener('message', (e) => {
@@ -227,13 +272,6 @@ function getPairingHtml(pairingUrl: string, displayUrl: string, info: PairingInf
 </html>`;
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 /**
  * Store/load paired phones from extension global state.

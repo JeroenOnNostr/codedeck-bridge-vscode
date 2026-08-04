@@ -26,8 +26,15 @@ import type { PairedPhone, PairRequestMessage } from './types';
 import * as meshAdmin from './meshAdmin';
 import { registerPhoneOnRelay } from './relayAdmin';
 
-/** How long an open pairing window accepts auto pair-requests. */
-const PAIRING_WINDOW_MS = 180_000;
+/**
+ * How long an open pairing window accepts auto pair-requests.
+ *
+ * Ten minutes rather than three: a copied link has to reach the phone through a
+ * chat app before anyone can paste it, and the old window routinely expired
+ * mid-transit. Closing the pairing tab still revokes it immediately
+ * (`panel.onDidDispose`), so that stays the fast way to shut the window.
+ */
+const PAIRING_WINDOW_MS = 600_000;
 
 let bridgeCore: BridgeCore | undefined;
 let statusBar: StatusBar | undefined;

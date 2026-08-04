@@ -6,6 +6,7 @@ import { touchesSecretPath, isBenignPlanDirWrite } from '../sdkSession';
 import { redactSecrets } from '../deviceActions';
 import { resolveSessionCwd, listWorkspaceFolders } from '../core';
 import { execFileSync } from 'child_process';
+import { embedJsString } from '../webviewHtml';
 
 const PLANS_DIR = path.join(
   process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), '.claude'),
@@ -333,5 +334,32 @@ describe('listWorkspaceFolders — project folders for the phone picker', () => 
   it('returns an empty list for an unreadable workspace instead of throwing', () => {
     // A failed scan costs the picker its list; it must never break session publishing.
     expect(listWorkspaceFolders(path.join(root, 'no-such-workspace'))).toEqual([]);
+  });
+});
+
+describe('embedJsString — inline <script> embedding (CDB-039)', () => {
+  it('quotes an ordinary pairing URL as a valid JS string', () => {
+    const url = 'codedeck://pair?npub=npub1abc&relays=wss%3A%2F%2Fnos.lol&machine=laptop';
+    expect(JSON.parse(embedJsString(url))).toBe(url);
+  });
+
+  it('never emits a literal </script>, which would close the tag early', () => {
+    const hostile = 'codedeck://pair?machine=</script><img src=x onerror=alert(1)>';
+    const embedded = embedJsString(hostile);
+
+    expect(embedded).not.toContain('</script>');
+    expect(embedded).not.toContain('<');
+    expect(embedded).not.toContain('>');
+    // Still round-trips — escaping must not corrupt the value it protects.
+    expect(JSON.parse(embedded)).toBe(hostile);
+  });
+
+  it('escapes the line separators that are newlines to a JS parser but not to JSON', () => {
+    const withSeparators = 'codedeck://pair?machine=a\u2028b\u2029c';
+    const embedded = embedJsString(withSeparators);
+
+    expect(embedded).not.toContain('\u2028');
+    expect(embedded).not.toContain('\u2029');
+    expect(JSON.parse(embedded)).toBe(withSeparators);
   });
 });
