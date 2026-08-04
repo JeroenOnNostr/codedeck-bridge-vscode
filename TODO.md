@@ -1,5 +1,33 @@
 # TODO — Codedeck Bridge (VSCode Extension)
 
+## Distribution
+
+- [ ] **CDB-038: the extension has never been on the VS Code Marketplace, so installing it means
+  finding a GitHub release** — verified 2026-08-04: the gallery API returns 0 results for
+  `halfzwarelinda.codedeck-bridge`, `marketplace.visualstudio.com/items?itemName=…` 404s, and the
+  publisher `halfzwarelinda` has no extensions. Open VSX answers "Extension not found". Nothing in
+  this repo ever published — there is no `vsce publish`, no CI workflow and no `CHANGELOG.md`; only
+  `vsce package`. So this is a gap, not a takedown. (Searching "codedeck" on the marketplace finds
+  `ischca.code-deck`, an unrelated extension — easy to mistake for ours.)
+
+  Publishing needs a human first: an Azure DevOps organisation, a marketplace publisher, and a PAT
+  with **Marketplace → Manage** scope. Note `package.json`'s `repository.url` still points at
+  `HalfzwareLinda/codedeck-bridge-vscode` while the remote is `JeroenOnNostr/…` — the marketplace
+  renders that link on the listing page, so fix it before any publish.
+
+  Then the listing needs what `vsce package` currently warns about or omits: `icon`, `LICENSE`,
+  `CHANGELOG.md`, real `categories`/`keywords`, and a README written for a stranger rather than for
+  us.
+
+  **The blocker is platform, not polish.** The Agent SDK ships its `claude` binary as 8 optional
+  platform packages, and `.vscodeignore` deliberately keeps only `claude-agent-sdk-linux-x64`
+  (dropping musl/win32/darwin, "which otherwise add ~230 MB each"). So today's artifact is 89 MB
+  **and silently linux-x64-only** — publishing it as-is would hand Mac and Windows users an install
+  that cannot start. Decide the shape first: either declare `"target": "linux-x64"` and publish
+  vsce **platform-specific** builds (one per target, ~89 MB each), or stop bundling the binary
+  altogether and require a `claude` on `PATH`, which collapses the artifact to a few MB. The same
+  call governs the npm/`npx` route in CDB-036 — settle it once, for both.
+
 ## Standalone bridge (no IDE)
 
 - [ ] **CDB-036: the bridge only runs inside VSCode, so a colleague on any other editor can't use
