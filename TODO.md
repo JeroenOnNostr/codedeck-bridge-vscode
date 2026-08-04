@@ -1,5 +1,48 @@
 # TODO — Codedeck Bridge (VSCode Extension)
 
+## Standalone bridge (no IDE)
+
+- [ ] **CDB-036: the bridge only runs inside VSCode, so a colleague on any other editor can't use
+  CodeDeck at all** — CodeDeck mobile reaches a laptop only through this extension, and the
+  extension only exists as a `.vsix`. Everyone on the team uses a different IDE, so "install
+  CodeDeck" currently reads "switch to VSCode first". Nothing about the bridge needs an editor:
+  `core.ts` was written VSCode-free on purpose (`BridgeCore` — "does not depend on VSCode APIs"),
+  and only 3 of the 14 files in `src/` import `vscode` (`extension.ts`, `pairing.ts`,
+  `statusBar.ts`). Finishing it means giving `BridgeCore` a second host, not rewriting it.
+
+  | VSCode dependency | CLI replacement |
+  |---|---|
+  | `extension.ts` lifecycle | `src/cli.ts` — long-lived process, same `BridgeCore` wiring, same 60s heartbeat + usage push, same 30s `lastSeenTimestamp` write; SIGINT/SIGTERM does what `deactivate()` does (publish an empty session list so phones see the machine drop, then `dispose()`) |
+  | `getConfiguration('codedeck')` — `relays`, `machineName`, `relayRegisterEndpoint`, `relayRegisterToken` | `~/.codedeck/config.json` + `CODEDECK_*` env + flags, same key names and same defaults |
+  | `context.globalState` — `codedeck.secretKeyHex`, `codedeck.pairedPhones`, `codedeck_lastSeenTimestamp` | `~/.codedeck/state.json`, mode `0600` — it holds the bridge's secret key |
+  | `workspaceFolders[0].uri.fsPath` | `--workspace <dir>`, default `process.cwd()` — this is the root `resolveSessionCwd()` confines every session to and `listWorkspaceFolders()` enumerates for the v9 session list |
+  | `pairing.ts` webview | terminal QR (unicode half-blocks) + a PNG written beside it via `pngjs` (already a dependency, used by `screenshotDelivery.ts`); manual-npub fallback becomes an stdin prompt. The URL builder (base vs. display URL, mesh invite kept off screen) and `relay.openPairingWindow()` auto-pair are already host-agnostic — only rendering moves |
+  | `statusBar.ts` + output channel | stdout (the `log` callback already exists) + a `status` subcommand |
+  | `showWarningMessage`/`showInformationMessage` (`onMeshNotice`, relay-registration failures) | stderr warnings |
+
+  Ships as an **npm package run with `npx`** (decided 2026-07-30): a colleague runs
+  `npx @codedeck/bridge` in their project, scans the QR, done — no clone, no build, no editor. Node
+  is already a hard requirement (the Agent SDK spawns Claude Code), so nothing new is asked of them.
+  It must be a second esbuild target over the same `src/`, not a new repo — `types.ts` is the
+  hand-mirrored copy of the phone's protocol, and a fork of it would guarantee version drift.
+
+  Work: `src/cli.ts` plus small `cliConfig` / `cliState` / `terminalQr` modules; `bin`, `files` and a
+  `build:cli` script in `package.json` (keep `--external:@anthropic-ai/claude-agent-sdk` — it ships
+  its own CLI binary — and drop `--external:vscode`); subcommands `run` (default), `pair`, `status`,
+  `unpair`; a README section written for someone who has never opened VSCode; publish under a scope
+  the team can install from. Mesh onboarding already degrades correctly without `nvpn`
+  (`meshAdmin.createInvite()` returns null and the pure-pairing QR still works) — verify that, don't
+  rebuild it. No phone-app change and no protocol bump.
+
+  Verify: on a machine with the extension **not** installed, `npx` in a scratch folder, pair a
+  phone, and drive one session end to end — create session with a `cwd`, permission card, plan
+  approval, mode + effort change, image upload, history catch-up after a relay drop. Then run the
+  CLI and the extension at the same time: they generate separate keypairs, so the phone sees **two
+  machines with the same name** rather than one — decide there whether the CLI defaults its machine
+  name to something distinguishable (e.g. `<hostname>-cli`) or refuses to start when a state file
+  for the same name is already live. Finally `Ctrl-C` and confirm the phone shows the machine
+  offline instead of stale sessions.
+
 ## GSD integration
 
 - [ ] **CDB-035: the phone had no way to know what folders the workspace holds** — ✅ code + tests
@@ -23,21 +66,26 @@
   <details><summary>Device-verification run-sheet</summary>
 
   **Preconditions.** Laptop running a bridge built from this commit (`npm run package` → install the
-  `.vsix` → **Reload Window**; the reload is what activates it). Phone on a CodeDeck build carrying
-  CD-059. Paired as usual; the workspace is the 32-project one.
+  `.vsix` → **Reload Window**; the reload is what activates it). **Check the packaged bundle before
+  installing** — `unzip -p codedeck-bridge-2026.7.31.vsix extension/out/extension.js | grep -o
+  'PROTOCOL_VERSION *= *[0-9]*'` must say `9`: the vsix that sat in the tree at release time had been
+  packaged three hours *before* this commit, still said `8`, and installing it changed nothing while
+  looking like a fix. Phone on a CodeDeck build carrying CD-059 **and CD-060** (the field is a select
+  now, not a type-to-filter input). Paired as usual; the workspace currently scans to 45 folders.
 
   **Steps.**
   1. On the phone, tap **+** on the Framework machine to open **New Session**.
-  2. Tap the **Project folder** field.
-  3. Type `nostr` to filter.
+  2. Tap the **Project folder** field and scroll the picker.
+  3. Pick `nostr-relays/rocket-relay`, start the session.
 
   **Pass oracle.** Step 2 lists the real workspace folders (`atna`, `codedeck`, `gantry`, `yenn`, …)
-  and step 3 narrows to `nostr-relays` plus its nested projects `nostr-relays/rocket-relay`,
-  `nostr-relays/impostr-relay` and the other three. **Pre-fix the dropdown had one entry — "VScode
-  workspace for building nostr apps", the workspace root itself.** Then pick `yenn`, start the
-  session, and confirm on the laptop that the session's cwd really is `…/yenn` (bridge output
-  channel logs the created session, and the session card's project reads `yenn`) — the list is only
-  worth anything if the entries it offers are accepted verbatim as `cwd`.
+  including the nested ones — `nostr-relays/rocket-relay`, `nostr-relays/impostr-relay` and the other
+  three. **Pre-fix the dropdown had one entry — the basename of a session already running, since
+  every session started at the workspace root.** After step 3, confirm on the laptop that the
+  session's cwd really is `…/nostr-relays/rocket-relay` (bridge output channel logs the created
+  session; the session card's project reads `rocket-relay`) — a nested entry is the discriminating
+  case, because it is the one a naive `path.join(root, name)` would still resolve but a sanitizer
+  that strips separators would silently redirect to the root.
   </details>
 
 - [ ] **CDB-034: the session-meta request rewrites a slash command's arguments** — ✅ code + tests
@@ -151,6 +199,38 @@
 
 - [ ] **CDB-029: Stop downgrading mid-session `max` effort to `xhigh`** — `sdkSession.ts:629-646` maps `max` → `xhigh` when the phone changes effort mid-session, because SDK 0.3.177's `applyFlagSettings` typed `Settings.effortLevel` as `low|medium|high|xhigh` only. SDK 0.3.220 documents `effortLevel` as accepting `'max'` on `applyFlagSettings` (session-scoped, never persisted to settings files) — so true `max` no longer needs a fresh session. Drop the mapping + the log line and let `max` through, keeping `auto` → clear.
 - [ ] **CDB-030: Advertise the SDK's live model list instead of the phone's hardcoded one** — The selectable model list lives in `codedeck/src/constants/models.ts` and has to be hand-edited on every model launch (CD-050 was exactly that). SDK 0.3.220 exposes `query.supportedModels(): Promise<ModelInfo[]>`; the bridge could report it in the session list / a new `models` message so the phone's picker is always current, falling back to the hardcoded list for older bridges.
+
+## Connection Stability
+
+- [x] **CDB-037: pairing a second phone puts the status bar in a permanent 2-second
+  "N phones" ↔ "offline" flap** — ✅ code + tests done, install-verify owed.
+  `updatePairedPhones()` reconnects to widen the `authors` filter, and `connect()` →
+  `disconnect()` → `pool.destroy()` closes the live subscription *synchronously*
+  (`AbstractRelay.close()` → `closeAllSubscriptions()` → `sub.onclose()`). `onclose` couldn't
+  tell that teardown from a dropped relay, so it reported `'disconnected'` **and** called
+  `scheduleReconnect()`; 2s later that reconnect tore down the subscription that had just
+  come up, whose `onclose` scheduled the next one. `oneose` resets `reconnectAttempt`, so the
+  backoff stayed pinned at the 2s floor and the loop never decayed. The `reconnecting` guard
+  in `disconnect()` didn't help — it only gates the *direct* emission, and the pool's callback
+  bypasses it. Side effect: the session list was republished to every phone every 2s.
+  Observed 128 cycles in one session's log, still running ~19h after the pair.
+  Fix: `connectionEpoch`, bumped at the top of `disconnect()`; `connect()` captures it and
+  both `oneose`/`onclose` bail when superseded. Genuine drops on the *current* subscription
+  still report and reconnect. Covered by `src/__tests__/nostrRelay.connection.test.ts`
+  (all 3 fail without the guard).
+
+  **Install-verify run-sheet** (host tests can't see VSCode's status bar):
+  1. Install `codedeck-bridge-2026.7.311.vsix` (Extensions → ⋯ → Install from VSIX), reload.
+  2. Pair phone 1, wait for the status bar to read `Codedeck: 1 phone`.
+  3. Pair phone 2 from the QR panel — this is the trigger; before the fix the flap started
+     the instant `Phone registered on private relay` appeared.
+  4. **Pass oracle:** for 2 minutes straight the status bar holds `Codedeck: 2 phones` and
+     never blinks to `Codedeck: offline`. In the "Codedeck Bridge" output channel,
+     `Relay subscription closed` / `Scheduling reconnect attempt 1 in 2000ms` must NOT repeat
+     on a 2s cadence, and `Publishing session list event` must settle to the 60s heartbeat
+     rather than firing every 2s. A single `Ignoring close of superseded subscription` line
+     at pair time is the fix working.
+  5. Both phones should list the machine's sessions and accept input.
 
 ## Mode Tracking
 
