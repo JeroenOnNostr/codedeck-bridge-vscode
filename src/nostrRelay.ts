@@ -63,6 +63,14 @@ export class NostrRelay {
   private reconnecting = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  // --- Subscription generation (CDB-037) ---
+  // Bumped at the top of every teardown, before `pool.destroy()` — which closes the live
+  // subscription *synchronously* and calls its `onclose`. So a subscription we deliberately
+  // replaced (pairing a phone, changing relays) still calls back on the way out. Without
+  // this guard that teardown looks like a dropped connection: it reports 'disconnected' and
+  // schedules a reconnect, which tears down the subscription that just came up — a
+  // self-perpetuating 2s flap.
+  private connectionEpoch = 0;
   private static readonly RECONNECT_BASE_MS = 2_000;
   private static readonly RECONNECT_MAX_MS = 30_000;
   private disposed = false;
@@ -166,8 +174,10 @@ export class NostrRelay {
 
   connect(): void {
     this.reconnecting = true;
-    this.disconnect();
+    this.disconnect(); // bumps connectionEpoch, orphaning the previous subscription's callbacks
     this.reconnecting = false;
+
+    const epoch = this.connectionEpoch;
 
     this.pool = new SimplePool({ enableReconnect: true });
 
@@ -198,11 +208,16 @@ export class NostrRelay {
             this.handleIncomingEvent(event);
           },
           oneose: () => {
+            if (epoch !== this.connectionEpoch) { return; } // superseded subscription
             this.reconnectAttempt = 0; // reset on success
             this.log('[Codedeck] Connected to relays, subscription active');
             this.onConnectionChange?.('connected');
           },
           onclose: (reasons) => {
+            if (epoch !== this.connectionEpoch) {
+              this.log(`[Codedeck] Ignoring close of superseded subscription (epoch ${epoch}): ${JSON.stringify(reasons)}`);
+              return;
+            }
             this.log(`[Codedeck] Relay subscription closed: ${JSON.stringify(reasons)}`);
             this.onConnectionChange?.('disconnected', 'Relay connection lost — reconnecting');
             this.scheduleReconnect();
@@ -235,6 +250,9 @@ export class NostrRelay {
   }
 
   disconnect(): void {
+    // Orphan the live subscription's callbacks before tearing it down. Anything they
+    // report from here on is our own teardown, not a connection we lost.
+    this.connectionEpoch++;
     const wasConnected = this.isConnected();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
